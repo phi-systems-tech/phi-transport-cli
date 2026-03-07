@@ -19,6 +19,11 @@ CLI transport plugin for `phi-core`.
 
 - Authentication is validated by `phi-core`.
 - Tokens and session handling follow the shared transport contract.
+- The CLI socket is a local Unix socket (`/var/lib/phi/cli.sock`) with permissions
+  `srw-rw----` owned by `phi:phi` by default; access is therefore limited to user
+  `phi` and members of group `phi`.
+- When invoked as root, `phi-cli` drops privileges to the `phi` user before
+  attempting to connect, and executes with the reduced `phi` process identity.
 
 ## Known Issues
 
