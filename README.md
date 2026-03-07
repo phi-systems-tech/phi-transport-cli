@@ -8,6 +8,7 @@ CLI transport plugin for `phi-core`.
 
 - Local command-line transport (`cli`).
 - Server-side plugin used by `phi-core`.
+- Unix domain socket endpoint (default: `/var/lib/phi/cli.sock`).
 
 ## Network Exposure
 
@@ -26,6 +27,7 @@ CLI transport plugin for `phi-core`.
 ## License
 
 See `LICENSE`.
+Copyright (c) 2026 Phisys Ltd. (Switzerland).
 
 ---
 
@@ -41,6 +43,7 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 - Sync/async core call routing
 - ACK/response rendering
 - Structured error output
+- Initial local CLI client (`phi-cli`) with `adapter list`
 
 ### Runtime Model
 
@@ -57,6 +60,13 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 
 - Canonical contract: `phi-transport-api/PROTOCOLL.md`
 - Transport-specific behavior should be documented in this repository.
+- Every `phi-transport-cli` implementation must follow the canonical transport
+  contract in `phi-transport-api/PROTOCOLL.md`.
+- Do not introduce transport-local protocol features that are not defined in
+  the canonical contract.
+- If a required capability is missing in the transport API contract, define it
+  in `phi-transport-api/PROTOCOLL.md` first, align `phi-core`/transport API as
+  needed, and only then implement it in `phi-transport-cli`.
 
 ### Runtime Requirements
 
@@ -79,10 +89,19 @@ cmake -S . -B ../build/phi-transport-cli/release-ninja -G Ninja
 cmake --build ../build/phi-transport-cli/release-ninja --parallel
 ```
 
+### Example
+
+```bash
+phi-cli adapter list
+phi-cli adapter list --json
+phi-cli adapter list --socket /var/lib/phi/cli.sock
+```
+
 ### Installation
 
 - Output shared library: `libphi_transport_cli.so`
-- Deployment location: `/opt/phi/plugins/transports/` (or distro equivalent)
+- Deployment location: `/usr/lib/phi/plugins/transports/` (or distro equivalent)
+- CLI binary: `/usr/bin/phi-cli`
 
 ### Observability
 
@@ -94,7 +113,7 @@ cmake --build ../build/phi-transport-cli/release-ninja --parallel
 
 ### Maintainers
 
-- Phi Systems Tech team
+- Phisys Ltd. (Switzerland)
 
 ### Issue Tracker
 
