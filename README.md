@@ -77,6 +77,8 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 
 - `phi-core` with transport plugin loading enabled.
 - Invoking `phi-cli` as root is supported; it automatically drops to user `phi` before socket connect.
+- For deployment checks, use `scripts/check-phi-cli-runtime.sh` to verify the CLI socket path,
+  mode, and ownership (`phi:phi`, mode `660`).
 
 ### Build Requirements
 
@@ -106,6 +108,7 @@ phi-cli adapter restart --external-id hue-bridge-main
 phi-cli adapter restart --name "Living Room"
 phi-cli adapter restart --plugin-type hue --all
 phi-cli adapter reload --plugin-type hue
+scripts/check-phi-cli-runtime.sh /var/lib/phi/cli.sock
 ```
 
 Selector rules (aligned to `phi-transport-api/PROTOCOLL.md`):
