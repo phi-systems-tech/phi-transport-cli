@@ -43,7 +43,7 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 - Sync/async core call routing
 - ACK/response rendering
 - Structured error output
-- Initial local CLI client (`phi-cli`) with `adapter list`
+- Local CLI client (`phi-cli`) with adapter list/start/stop/restart/reload
 
 ### Runtime Model
 
@@ -95,7 +95,21 @@ cmake --build ../build/phi-transport-cli/release-ninja --parallel
 phi-cli adapter list
 phi-cli adapter list --json
 phi-cli adapter list --socket /var/lib/phi/cli.sock
+phi-cli adapter restart --id 42
+phi-cli adapter restart --external-id hue-bridge-main
+phi-cli adapter restart --name "Living Room"
+phi-cli adapter restart --plugin-type hue --all
+phi-cli adapter reload --plugin-type hue
 ```
+
+Selector rules (aligned to `phi-transport-api/PROTOCOLL.md`):
+
+- `cmd.adapter.start|stop|restart` are executed with resolved `adapterId`.
+- `--id`, `--external-id`, and `--name` resolve to exactly one adapter instance.
+- `--name` must resolve uniquely, otherwise request is rejected as ambiguous.
+- `--plugin-type` is allowed only together with `--all` for instance operations
+  (fan-out over all resolved adapter ids).
+- Process/plugin-level reload uses `cmd.adapter.reload --plugin-type <type>`.
 
 ### Installation
 
