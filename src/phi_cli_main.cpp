@@ -6,6 +6,13 @@
 #include <QLocalSocket>
 #include <QTextStream>
 
+#include <cerrno>
+#include <cstring>
+#include <pwd.h>
+#include <grp.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 namespace {
 
 constexpr const char kDefaultSocketPath[] = "/var/lib/phi/cli.sock";
@@ -372,6 +379,46 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
     return true;
 }
 
+bool dropRootToPhi(QString *errorOut)
+{
+    if (geteuid() != 0)
+        return true;
+
+    struct passwd *pw = getpwnam("phi");
+    if (!pw) {
+        if (errorOut)
+            *errorOut = QStringLiteral("User 'phi' not found; cannot drop root privileges");
+        return false;
+    }
+
+    if (setgid(pw->pw_gid) != 0) {
+        if (errorOut)
+            *errorOut = QStringLiteral("Failed to drop group: %1").arg(QString::fromLocal8Bit(std::strerror(errno)));
+        return false;
+    }
+
+    if (setgroups(1, &pw->pw_gid) != 0) {
+        if (errorOut)
+            *errorOut = QStringLiteral("Failed to reset supplementary groups: %1")
+                             .arg(QString::fromLocal8Bit(std::strerror(errno)));
+        return false;
+    }
+
+    if (setuid(pw->pw_uid) != 0) {
+        if (errorOut)
+            *errorOut = QStringLiteral("Failed to drop user: %1").arg(QString::fromLocal8Bit(std::strerror(errno)));
+        return false;
+    }
+
+    if (setuid(0) == 0) {
+        if (errorOut)
+            *errorOut = QStringLiteral("Unexpectedly able to regain root privileges; aborting");
+        return false;
+    }
+
+    return true;
+}
+
 QList<int> resolveAdapterIds(const CliOptions &opts, const QJsonArray &adapters, QString *errorOut)
 {
     QList<int> ids;
@@ -442,6 +489,13 @@ QList<int> resolveAdapterIds(const CliOptions &opts, const QJsonArray &adapters,
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
+
+    QString dropError;
+    if (!dropRootToPhi(&dropError)) {
+        QTextStream(stderr) << dropError << "\n";
+        return 1;
+    }
+
     const QStringList args = app.arguments();
     CliOptions opts;
     QString parseError;

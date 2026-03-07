@@ -71,6 +71,7 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 ### Runtime Requirements
 
 - `phi-core` with transport plugin loading enabled.
+- Invoking `phi-cli` as root is supported; it automatically drops to user `phi` before socket connect.
 
 ### Build Requirements
 
