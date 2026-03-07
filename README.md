@@ -75,8 +75,8 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 ### Build
 
 ```bash
-cmake -S . -B build
-cmake --build build --parallel
+cmake -S . -B ../build/phi-transport-cli/release-ninja -G Ninja
+cmake --build ../build/phi-transport-cli/release-ninja --parallel
 ```
 
 ### Installation
