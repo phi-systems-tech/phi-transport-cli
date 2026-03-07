@@ -424,6 +424,18 @@ void CliTransport::handleCommand(QLocalSocket *socket,
         return;
     }
 
+    const bool asyncUnsupportedTopic =
+        asyncSubmit.error.has_value()
+        && asyncSubmit.error->msg == QStringLiteral("Unsupported async topic");
+    if (!asyncUnsupportedTopic) {
+        const QString asyncErr =
+            asyncSubmit.error.has_value() && !asyncSubmit.error->msg.isEmpty()
+                ? asyncSubmit.error->msg
+                : QStringLiteral("Command rejected");
+        sendAck(socket, cid, false, topic, asyncErr);
+        return;
+    }
+
     const SyncResult syncResult = callCoreSync(topic, payload);
     if (syncResult.accepted) {
         sendAck(socket, cid, true, topic);
@@ -432,9 +444,7 @@ void CliTransport::handleCommand(QLocalSocket *socket,
     }
 
     const bool unknownTopic =
-        asyncSubmit.error.has_value()
-        && syncResult.error.has_value()
-        && asyncSubmit.error->msg == QStringLiteral("Unsupported async topic")
+        syncResult.error.has_value()
         && syncResult.error->msg == QStringLiteral("Unsupported sync topic");
 
     if (unknownTopic) {
