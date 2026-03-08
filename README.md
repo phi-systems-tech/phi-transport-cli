@@ -49,6 +49,7 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 - ACK/response rendering
 - Structured error output
 - Local CLI client (`phi-cli`) with adapter list/start/stop/restart/reload
+- Local CLI client (`phi-cli`) with transport start/stop/restart/reload
 
 ### Runtime Model
 
@@ -108,6 +109,8 @@ phi-cli adapter restart --external-id hue-bridge-main
 phi-cli adapter restart --name "Living Room"
 phi-cli adapter restart --plugin-type hue --all
 phi-cli adapter reload --plugin-type hue
+phi-cli transport restart --plugin-type ws
+phi-cli transport reload --plugin-type cli
 scripts/check-phi-cli-runtime.sh /var/lib/phi/cli.sock
 ```
 
@@ -119,6 +122,9 @@ Selector rules (aligned to `phi-transport-api/PROTOCOLL.md`):
 - `--plugin-type` is allowed only together with `--all` for instance operations
   (fan-out over all resolved adapter ids).
 - Process/plugin-level reload uses `cmd.adapter.reload --plugin-type <type>`.
+- Transport lifecycle uses `cmd.transport.start|stop|restart|reload --plugin-type <type>`.
+- Transport `restart` keeps the already loaded plugin binary and performs stop/start.
+- Transport `reload` performs a full plugin unload/load before start.
 
 ### Installation
 

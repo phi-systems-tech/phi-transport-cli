@@ -16,6 +16,9 @@
 namespace {
 
 constexpr const char kDefaultSocketPath[] = "/var/lib/phi/cli.sock";
+constexpr int kConnectTimeoutMs = 2000;
+constexpr int kWriteTimeoutMs = 2000;
+constexpr int kResponseTimeoutMs = 15000;
 
 void printUsage()
 {
@@ -25,6 +28,7 @@ void printUsage()
     out << "  phi-cli adapter start|stop|restart (--id <id> | --external-id <id> | --name <name>) [--socket <path>]\n";
     out << "  phi-cli adapter start|stop|restart --plugin-type <type> --all [--socket <path>]\n";
     out << "  phi-cli adapter reload --plugin-type <type> [--socket <path>]\n";
+    out << "  phi-cli transport start|stop|restart|reload --plugin-type <type> [--socket <path>]\n";
 }
 
 bool tryReadCid(const QJsonValue &value, quint64 *cidOut)
@@ -117,7 +121,7 @@ bool sendCommand(const QString &socketPath,
 {
     QLocalSocket socket;
     socket.connectToServer(socketPath);
-    if (!socket.waitForConnected(2000)) {
+    if (!socket.waitForConnected(kConnectTimeoutMs)) {
         if (errorOut)
             *errorOut = QStringLiteral("Failed to connect to socket: %1").arg(socketPath);
         return false;
@@ -133,7 +137,7 @@ bool sendCommand(const QString &socketPath,
 
     const QByteArray wire = QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n';
     socket.write(wire);
-    if (!socket.waitForBytesWritten(2000)) {
+    if (!socket.waitForBytesWritten(kWriteTimeoutMs)) {
         if (errorOut)
             *errorOut = QStringLiteral("Failed to send request");
         return false;
@@ -142,7 +146,7 @@ bool sendCommand(const QString &socketPath,
     QByteArray buffer;
     bool ackSeen = false;
     while (true) {
-        if (!socket.waitForReadyRead(5000)) {
+        if (!socket.waitForReadyRead(kResponseTimeoutMs)) {
             if (errorOut)
                 *errorOut = QStringLiteral("Timeout waiting for response");
             return false;
@@ -237,6 +241,7 @@ enum class AdapterSelectorType {
 };
 
 struct CliOptions {
+    QString scope;
     QString action;
     QString socketPath = QString::fromLatin1(kDefaultSocketPath);
     bool jsonOutput = false;
@@ -250,14 +255,72 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
 {
     if (!optsOut)
         return false;
-    if (args.size() < 3 || args.at(1) != QStringLiteral("adapter")) {
+    if (args.size() < 3) {
         if (errorOut)
             *errorOut = QStringLiteral("Invalid command");
         return false;
     }
 
     CliOptions opts;
+    opts.scope = args.at(1);
     opts.action = args.at(2);
+    if (opts.scope != QStringLiteral("adapter") && opts.scope != QStringLiteral("transport")) {
+        if (errorOut)
+            *errorOut = QStringLiteral("Unknown scope: %1").arg(opts.scope);
+        return false;
+    }
+
+    if (opts.scope == QStringLiteral("transport")) {
+        if (opts.action != QStringLiteral("start")
+            && opts.action != QStringLiteral("stop")
+            && opts.action != QStringLiteral("restart")
+            && opts.action != QStringLiteral("reload")) {
+            if (errorOut)
+                *errorOut = QStringLiteral("Unknown action: %1").arg(opts.action);
+            return false;
+        }
+
+        for (int i = 3; i < args.size(); ++i) {
+            const QString arg = args.at(i);
+            if (arg == QStringLiteral("--socket")) {
+                if (i + 1 >= args.size()) {
+                    if (errorOut)
+                        *errorOut = QStringLiteral("Missing value for --socket");
+                    return false;
+                }
+                opts.socketPath = args.at(++i);
+                continue;
+            }
+            if (arg == QStringLiteral("--plugin-type")) {
+                if (i + 1 >= args.size()) {
+                    if (errorOut)
+                        *errorOut = QStringLiteral("Missing value for --plugin-type");
+                    return false;
+                }
+                opts.selectorType = AdapterSelectorType::ByPluginType;
+                opts.selectorValue = args.at(++i);
+                continue;
+            }
+            if (errorOut)
+                *errorOut = QStringLiteral("Unknown argument: %1").arg(arg);
+            return false;
+        }
+
+        if (opts.selectorType != AdapterSelectorType::ByPluginType || opts.selectorValue.isEmpty()) {
+            if (errorOut)
+                *errorOut = QStringLiteral("transport %1 requires --plugin-type <type>").arg(opts.action);
+            return false;
+        }
+        if (opts.all || opts.jsonOutput) {
+            if (errorOut)
+                *errorOut = QStringLiteral("transport commands do not support --all or --json");
+            return false;
+        }
+
+        *optsOut = opts;
+        return true;
+    }
+
     if (opts.action != QStringLiteral("list")
         && opts.action != QStringLiteral("start")
         && opts.action != QStringLiteral("stop")
@@ -517,6 +580,21 @@ int main(int argc, char **argv)
             QTextStream(stdout) << QString::fromUtf8(QJsonDocument(adapters).toJson(QJsonDocument::Indented));
         else
             printAdapterTable(adapters);
+        return 0;
+    }
+
+    if (opts.scope == QStringLiteral("transport")) {
+        QJsonObject response;
+        QString error;
+        QJsonObject payload;
+        payload.insert(QStringLiteral("pluginType"), opts.selectorValue);
+        const QString topic = QStringLiteral("cmd.transport.%1").arg(opts.action);
+        if (!sendCommand(opts.socketPath, topic, payload, &response, &error)) {
+            QTextStream(stderr) << error << "\n";
+            return 1;
+        }
+        QTextStream(stdout) << "Transport " << opts.action << " completed for pluginType '"
+                            << opts.selectorValue << "'\n";
         return 0;
     }
 

@@ -99,20 +99,14 @@ void CliTransport::stop()
     m_running = false;
 }
 
-bool CliTransport::reloadConfig(const QJsonObject &config, QString *errorString)
-{
-    if (!m_running)
-        return start(config, errorString);
-
-    stop();
-    return start(config, errorString);
-}
-
 void CliTransport::onCoreAsyncResult(CmdId cmdId, const QJsonObject &payload)
 {
     auto it = m_pendingCommands.find(cmdId);
-    if (it == m_pendingCommands.end())
+    if (it == m_pendingCommands.end()) {
+        qCWarning(cliTransportLog).noquote()
+            << tr("No pending CLI command for cmdId=%1").arg(static_cast<qulonglong>(cmdId));
         return;
+    }
 
     const PendingCommand pending = it.value();
     m_pendingCommands.erase(it);

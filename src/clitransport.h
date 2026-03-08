@@ -29,7 +29,6 @@ public:
 
     bool start(const QJsonObject &config, QString *errorString) override;
     void stop() override;
-    bool reloadConfig(const QJsonObject &config, QString *errorString) override;
 
 protected:
     void onCoreAsyncResult(CmdId cmdId, const QJsonObject &payload) override;
