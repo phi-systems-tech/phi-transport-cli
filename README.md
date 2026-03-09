@@ -106,6 +106,8 @@ cmake --build ../build/phi-transport-cli/release-ninja --parallel
 ### Example
 
 ```bash
+phi-cli discover
+phi-cli discover --json
 phi-cli adapter list
 phi-cli adapter discover
 phi-cli adapter discover hue --json
@@ -125,10 +127,12 @@ scripts/check-phi-cli-runtime.sh /var/lib/phi/@1/cli.sock
 Selector rules (aligned to `phi-transport-api/PROTOCOLL.md`):
 
 - `cmd.adapter.start|stop|restart` are executed with resolved `adapterId`.
-- `cmd.adapters.stream.start` with `kind=adapter.discover` is used for `phi-cli adapter discover`.
+- `phi-cli discover` uses `cmd.stream.start` with `kind=network.discover`.
+- `phi-cli adapter discover` uses `cmd.stream.start` with `kind=adapter.discover`.
 - `--id`, `--external-id`, and `--name` resolve to exactly one adapter instance.
 - `--name` must resolve uniquely, otherwise request is rejected as ambiguous.
-- `<plugin>` is allowed only together with `--all` for instance operations
+- `<plugin>` is allowed only together with `--all` for adapter instance
+  lifecycle operations (`start|stop|restart`).
   (fan-out over all resolved adapter ids).
 - `<plugin>` is optional for `adapter discover` and acts as a discovery filter.
 - Process/plugin-level reload uses `cmd.adapter.reload <plugin>`.

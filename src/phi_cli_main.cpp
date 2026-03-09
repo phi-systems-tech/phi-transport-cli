@@ -38,6 +38,7 @@ void printUsage()
 {
     QTextStream out(stdout);
     out << "Usage:\n";
+    out << "  phi-cli discover [--tenant <tenant>] [--socket <path>] [--json]\n";
     out << "  phi-cli adapter list [--tenant <tenant>] [--socket <path>] [--json]\n";
     out << "  phi-cli adapter discover [<plugin>] [--tenant <tenant>] [--socket <path>] [--json]\n";
     out << "  phi-cli adapter start|stop|restart (--id <id> | --external-id <id> | --name <name>) [--tenant <tenant>] [--socket <path>]\n";
@@ -296,6 +297,7 @@ QJsonObject sanitizeDiscoveryCandidate(QJsonObject candidate)
 }
 
 bool runDiscoveryStream(const QString &socketPath,
+                        const QString &kind,
                         const QStringList &pluginTypes,
                         QJsonArray *candidatesOut,
                         QString *errorOut)
@@ -319,14 +321,13 @@ bool runDiscoveryStream(const QString &socketPath,
     }
 
     QJsonObject payload;
-    payload.insert(QStringLiteral("adapterId"), 0);
-    payload.insert(QStringLiteral("kind"), QStringLiteral("adapter.discover"));
+    payload.insert(QStringLiteral("kind"), kind);
     payload.insert(QStringLiteral("params"), params);
 
     QJsonObject request;
     request.insert(QStringLiteral("type"), QStringLiteral("cmd"));
     request.insert(QStringLiteral("cid"), static_cast<qint64>(cid));
-    request.insert(QStringLiteral("topic"), QStringLiteral("cmd.adapters.stream.start"));
+    request.insert(QStringLiteral("topic"), QStringLiteral("cmd.stream.start"));
     request.insert(QStringLiteral("payload"), payload);
 
     const QByteArray wire = QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n';
@@ -410,7 +411,7 @@ bool runDiscoveryStream(const QString &socketPath,
 
             const QString payloadStreamId = response.value(QStringLiteral("streamId")).toString().trimmed();
             const QString payloadCmd = response.value(QStringLiteral("cmd")).toString();
-            if (payloadStreamId != streamId || payloadCmd != QStringLiteral("cmd.adapters.stream.start"))
+            if (payloadStreamId != streamId || payloadCmd != QStringLiteral("cmd.stream.start"))
                 continue;
 
             if (type == QStringLiteral("event") && topic == QStringLiteral("stream.data")) {
@@ -477,7 +478,7 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
 {
     if (!optsOut)
         return false;
-    if (args.size() < 3) {
+    if (args.size() < 2) {
         if (errorOut)
             *errorOut = QStringLiteral("Invalid command");
         return false;
@@ -507,14 +508,59 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
         positionalArgs.push_back(arg);
     }
 
-    if (positionalArgs.size() < 3) {
+    if (positionalArgs.size() < 2) {
         if (errorOut)
             *errorOut = QStringLiteral("Invalid command");
         return false;
     }
 
-    opts.scope = positionalArgs.at(1);
-    opts.action = positionalArgs.at(2);
+    if (positionalArgs.at(1) == QStringLiteral("discover")) {
+        opts.scope = QStringLiteral("discover");
+        opts.action = QStringLiteral("discover");
+    } else {
+        if (positionalArgs.size() < 3) {
+            if (errorOut)
+                *errorOut = QStringLiteral("Invalid command");
+            return false;
+        }
+        opts.scope = positionalArgs.at(1);
+        opts.action = positionalArgs.at(2);
+    }
+
+    if (opts.scope == QStringLiteral("discover")) {
+        for (int i = 2; i < positionalArgs.size(); ++i) {
+            const QString arg = positionalArgs.at(i);
+            if (arg == QStringLiteral("--json")) {
+                opts.jsonOutput = true;
+                continue;
+            }
+            if (arg == QStringLiteral("--socket")) {
+                if (i + 1 >= positionalArgs.size()) {
+                    if (errorOut)
+                        *errorOut = QStringLiteral("Missing value for --socket");
+                    return false;
+                }
+                opts.socketPath = positionalArgs.at(++i);
+                opts.socketPathExplicit = true;
+                continue;
+            }
+            if (errorOut)
+                *errorOut = QStringLiteral("Unknown argument: %1").arg(arg);
+            return false;
+        }
+
+        if (!isValidTenant(opts.tenant)) {
+            if (errorOut)
+                *errorOut = QStringLiteral("Invalid tenant: %1").arg(opts.tenant);
+            return false;
+        }
+        if (!opts.socketPathExplicit)
+            opts.socketPath = defaultSocketPathForTenant(opts.tenant);
+
+        *optsOut = opts;
+        return true;
+    }
+
     if (opts.scope != QStringLiteral("adapter") && opts.scope != QStringLiteral("transport")) {
         if (errorOut)
             *errorOut = QStringLiteral("Unknown scope: %1").arg(opts.scope);
@@ -863,6 +909,20 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    if (opts.scope == QStringLiteral("discover")) {
+        QJsonArray candidates;
+        QString error;
+        if (!runDiscoveryStream(opts.socketPath, QStringLiteral("network.discover"), {}, &candidates, &error)) {
+            QTextStream(stderr) << error << "\n";
+            return 1;
+        }
+        if (opts.jsonOutput)
+            QTextStream(stdout) << QString::fromUtf8(QJsonDocument(candidates).toJson(QJsonDocument::Indented));
+        else
+            printDiscoveryTable(candidates);
+        return 0;
+    }
+
     if (opts.action == QStringLiteral("discover")) {
         QStringList pluginTypes;
         if (opts.selectorType == AdapterSelectorType::ByPluginType && !opts.selectorValue.isEmpty())
@@ -870,7 +930,7 @@ int main(int argc, char **argv)
 
         QJsonArray candidates;
         QString error;
-        if (!runDiscoveryStream(opts.socketPath, pluginTypes, &candidates, &error)) {
+        if (!runDiscoveryStream(opts.socketPath, QStringLiteral("adapter.discover"), pluginTypes, &candidates, &error)) {
             QTextStream(stderr) << error << "\n";
             return 1;
         }
