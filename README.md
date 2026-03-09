@@ -125,10 +125,10 @@ Selector rules (aligned to `phi-transport-api/PROTOCOLL.md`):
 - `cmd.adapter.start|stop|restart` are executed with resolved `adapterId`.
 - `--id`, `--external-id`, and `--name` resolve to exactly one adapter instance.
 - `--name` must resolve uniquely, otherwise request is rejected as ambiguous.
-- `<plugin-type>` is allowed only together with `--all` for instance operations
+- `<plugin>` is allowed only together with `--all` for instance operations
   (fan-out over all resolved adapter ids).
-- Process/plugin-level reload uses `cmd.adapter.reload <plugin-type>`.
-- Transport lifecycle uses `cmd.transport.start|stop|restart|reload <plugin-type>`.
+- Process/plugin-level reload uses `cmd.adapter.reload <plugin>`.
+- Transport lifecycle uses `cmd.transport.start|stop|restart|reload <plugin>`.
 - Transport `restart` keeps the already loaded plugin binary and performs stop/start.
 - Transport `reload` performs a full plugin unload/load before start.
 

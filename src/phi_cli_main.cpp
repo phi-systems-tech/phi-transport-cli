@@ -39,9 +39,9 @@ void printUsage()
     out << "Usage:\n";
     out << "  phi-cli adapter list [--tenant <tenant>] [--socket <path>] [--json]\n";
     out << "  phi-cli adapter start|stop|restart (--id <id> | --external-id <id> | --name <name>) [--tenant <tenant>] [--socket <path>]\n";
-    out << "  phi-cli adapter start|stop|restart <plugin-type> --all [--tenant <tenant>] [--socket <path>]\n";
-    out << "  phi-cli adapter reload <plugin-type> [--tenant <tenant>] [--socket <path>]\n";
-    out << "  phi-cli transport start|stop|restart|reload <plugin-type> [--tenant <tenant>] [--socket <path>]\n";
+    out << "  phi-cli adapter start|stop|restart <plugin> --all [--tenant <tenant>] [--socket <path>]\n";
+    out << "  phi-cli adapter reload <plugin> [--tenant <tenant>] [--socket <path>]\n";
+    out << "  phi-cli transport start|stop|restart|reload <plugin> [--tenant <tenant>] [--socket <path>]\n";
 }
 
 bool tryReadCid(const QJsonValue &value, quint64 *cidOut)
@@ -360,7 +360,7 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
 
         if (opts.selectorType != AdapterSelectorType::ByPluginType || opts.selectorValue.isEmpty()) {
             if (errorOut)
-                *errorOut = QStringLiteral("transport %1 requires <plugin-type>").arg(opts.action);
+                *errorOut = QStringLiteral("transport %1 requires <plugin>").arg(opts.action);
             return false;
         }
         if (opts.all || opts.jsonOutput) {
@@ -456,7 +456,7 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
     } else if (opts.action == QStringLiteral("reload")) {
         if (opts.selectorType != AdapterSelectorType::ByPluginType || opts.selectorValue.isEmpty()) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter reload requires <plugin-type>");
+                *errorOut = QStringLiteral("adapter reload requires <plugin>");
             return false;
         }
         if (opts.all || opts.jsonOutput) {
@@ -467,20 +467,20 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
     } else {
         if (opts.selectorType == AdapterSelectorType::None) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter %1 requires one selector (--id, --external-id, --name, or <plugin-type> with --all)")
+                *errorOut = QStringLiteral("adapter %1 requires one selector (--id, --external-id, --name, or <plugin> with --all)")
                                 .arg(opts.action);
             return false;
         }
         if (opts.selectorType == AdapterSelectorType::ByPluginType) {
             if (!opts.all) {
                 if (errorOut)
-                    *errorOut = QStringLiteral("<plugin-type> is only allowed with --all for adapter %1")
+                    *errorOut = QStringLiteral("<plugin> is only allowed with --all for adapter %1")
                                     .arg(opts.action);
                 return false;
             }
         } else if (opts.all) {
             if (errorOut)
-                *errorOut = QStringLiteral("--all is only supported with <plugin-type> for adapter %1").arg(opts.action);
+                *errorOut = QStringLiteral("--all is only supported with <plugin> for adapter %1").arg(opts.action);
             return false;
         }
         if (opts.jsonOutput) {
