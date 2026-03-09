@@ -286,6 +286,15 @@ bool fetchAdapters(const QString &socketPath, QJsonArray *adaptersOut, QString *
     return true;
 }
 
+QJsonObject sanitizeDiscoveryCandidate(QJsonObject candidate)
+{
+    candidate.remove(QStringLiteral("cmd"));
+    candidate.remove(QStringLiteral("seq"));
+    candidate.remove(QStringLiteral("tsMs"));
+    candidate.remove(QStringLiteral("streamId"));
+    return candidate;
+}
+
 bool runDiscoveryStream(const QString &socketPath,
                         const QStringList &pluginTypes,
                         QJsonArray *candidatesOut,
@@ -405,7 +414,7 @@ bool runDiscoveryStream(const QString &socketPath,
                 continue;
 
             if (type == QStringLiteral("event") && topic == QStringLiteral("stream.data")) {
-                candidates.append(response);
+                candidates.append(sanitizeDiscoveryCandidate(response));
                 continue;
             }
 
