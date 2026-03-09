@@ -113,10 +113,10 @@ phi-cli adapter list --socket /var/lib/phi/@1/cli.sock
 phi-cli adapter restart --id 42
 phi-cli adapter restart --external-id hue-bridge-main
 phi-cli adapter restart --name "Living Room"
-phi-cli adapter restart --plugin-type hue --all
-phi-cli adapter reload --plugin-type hue
-phi-cli transport restart --plugin-type ws
-phi-cli transport reload --plugin-type cli
+phi-cli adapter restart hue --all
+phi-cli adapter reload hue
+phi-cli transport restart ws
+phi-cli transport reload cli
 scripts/check-phi-cli-runtime.sh /var/lib/phi/@1/cli.sock
 ```
 
@@ -125,10 +125,10 @@ Selector rules (aligned to `phi-transport-api/PROTOCOLL.md`):
 - `cmd.adapter.start|stop|restart` are executed with resolved `adapterId`.
 - `--id`, `--external-id`, and `--name` resolve to exactly one adapter instance.
 - `--name` must resolve uniquely, otherwise request is rejected as ambiguous.
-- `--plugin-type` is allowed only together with `--all` for instance operations
+- `<plugin-type>` is allowed only together with `--all` for instance operations
   (fan-out over all resolved adapter ids).
-- Process/plugin-level reload uses `cmd.adapter.reload --plugin-type <type>`.
-- Transport lifecycle uses `cmd.transport.start|stop|restart|reload --plugin-type <type>`.
+- Process/plugin-level reload uses `cmd.adapter.reload <plugin-type>`.
+- Transport lifecycle uses `cmd.transport.start|stop|restart|reload <plugin-type>`.
 - Transport `restart` keeps the already loaded plugin binary and performs stop/start.
 - Transport `reload` performs a full plugin unload/load before start.
 

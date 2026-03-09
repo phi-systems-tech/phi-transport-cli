@@ -39,9 +39,9 @@ void printUsage()
     out << "Usage:\n";
     out << "  phi-cli adapter list [--tenant <tenant>] [--socket <path>] [--json]\n";
     out << "  phi-cli adapter start|stop|restart (--id <id> | --external-id <id> | --name <name>) [--tenant <tenant>] [--socket <path>]\n";
-    out << "  phi-cli adapter start|stop|restart --plugin-type <type> --all [--tenant <tenant>] [--socket <path>]\n";
-    out << "  phi-cli adapter reload --plugin-type <type> [--tenant <tenant>] [--socket <path>]\n";
-    out << "  phi-cli transport start|stop|restart|reload --plugin-type <type> [--tenant <tenant>] [--socket <path>]\n";
+    out << "  phi-cli adapter start|stop|restart <plugin-type> --all [--tenant <tenant>] [--socket <path>]\n";
+    out << "  phi-cli adapter reload <plugin-type> [--tenant <tenant>] [--socket <path>]\n";
+    out << "  phi-cli transport start|stop|restart|reload <plugin-type> [--tenant <tenant>] [--socket <path>]\n";
 }
 
 bool tryReadCid(const QJsonValue &value, quint64 *cidOut)
@@ -278,6 +278,7 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
 
     CliOptions opts;
     QStringList positionalArgs;
+    QString positionalPluginType;
     positionalArgs.reserve(args.size());
     positionalArgs.push_back(args.at(0));
 
@@ -335,19 +336,18 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
                 opts.socketPathExplicit = true;
                 continue;
             }
-            if (arg == QStringLiteral("--plugin-type")) {
-                if (i + 1 >= positionalArgs.size()) {
-                    if (errorOut)
-                        *errorOut = QStringLiteral("Missing value for --plugin-type");
-                    return false;
-                }
-                opts.selectorType = AdapterSelectorType::ByPluginType;
-                opts.selectorValue = positionalArgs.at(++i);
+            if (!arg.startsWith(QLatin1Char('-')) && positionalPluginType.isEmpty()) {
+                positionalPluginType = arg;
                 continue;
             }
             if (errorOut)
                 *errorOut = QStringLiteral("Unknown argument: %1").arg(arg);
             return false;
+        }
+
+        if (opts.selectorType == AdapterSelectorType::None && !positionalPluginType.isEmpty()) {
+            opts.selectorType = AdapterSelectorType::ByPluginType;
+            opts.selectorValue = positionalPluginType;
         }
 
         if (!isValidTenant(opts.tenant)) {
@@ -360,7 +360,7 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
 
         if (opts.selectorType != AdapterSelectorType::ByPluginType || opts.selectorValue.isEmpty()) {
             if (errorOut)
-                *errorOut = QStringLiteral("transport %1 requires --plugin-type <type>").arg(opts.action);
+                *errorOut = QStringLiteral("transport %1 requires <plugin-type>").arg(opts.action);
             return false;
         }
         if (opts.all || opts.jsonOutput) {
@@ -433,19 +433,18 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
             opts.selectorValue = positionalArgs.at(++i);
             continue;
         }
-        if (arg == QStringLiteral("--plugin-type")) {
-            if (i + 1 >= positionalArgs.size()) {
-                if (errorOut)
-                    *errorOut = QStringLiteral("Missing value for --plugin-type");
-                return false;
-            }
-            opts.selectorType = AdapterSelectorType::ByPluginType;
-            opts.selectorValue = positionalArgs.at(++i);
+        if (!arg.startsWith(QLatin1Char('-')) && positionalPluginType.isEmpty()) {
+            positionalPluginType = arg;
             continue;
         }
         if (errorOut)
             *errorOut = QStringLiteral("Unknown argument: %1").arg(arg);
         return false;
+    }
+
+    if (opts.selectorType == AdapterSelectorType::None && !positionalPluginType.isEmpty()) {
+        opts.selectorType = AdapterSelectorType::ByPluginType;
+        opts.selectorValue = positionalPluginType;
     }
 
     if (opts.action == QStringLiteral("list")) {
@@ -457,7 +456,7 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
     } else if (opts.action == QStringLiteral("reload")) {
         if (opts.selectorType != AdapterSelectorType::ByPluginType || opts.selectorValue.isEmpty()) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter reload requires --plugin-type <type>");
+                *errorOut = QStringLiteral("adapter reload requires <plugin-type>");
             return false;
         }
         if (opts.all || opts.jsonOutput) {
@@ -468,20 +467,20 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
     } else {
         if (opts.selectorType == AdapterSelectorType::None) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter %1 requires one selector (--id, --external-id, --name, or --plugin-type with --all)")
+                *errorOut = QStringLiteral("adapter %1 requires one selector (--id, --external-id, --name, or <plugin-type> with --all)")
                                 .arg(opts.action);
             return false;
         }
         if (opts.selectorType == AdapterSelectorType::ByPluginType) {
             if (!opts.all) {
                 if (errorOut)
-                    *errorOut = QStringLiteral("--plugin-type is only allowed with --all for adapter %1")
+                    *errorOut = QStringLiteral("<plugin-type> is only allowed with --all for adapter %1")
                                     .arg(opts.action);
                 return false;
             }
         } else if (opts.all) {
             if (errorOut)
-                *errorOut = QStringLiteral("--all is only supported with --plugin-type for adapter %1").arg(opts.action);
+                *errorOut = QStringLiteral("--all is only supported with <plugin-type> for adapter %1").arg(opts.action);
             return false;
         }
         if (opts.jsonOutput) {
