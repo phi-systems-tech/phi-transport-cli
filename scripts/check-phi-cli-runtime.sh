@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SOCKET_PATH="${1:-/var/lib/phi/cli.sock}"
+SOCKET_PATH="${1:-/var/lib/phi/@1/cli.sock}"
 
 if [[ ! -S "${SOCKET_PATH}" ]]; then
   echo "transport socket missing: ${SOCKET_PATH}" >&2

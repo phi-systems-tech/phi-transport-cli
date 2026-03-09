@@ -1,9 +1,11 @@
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QDir>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLocalSocket>
+#include <QRegularExpression>
 #include <QTextStream>
 
 #include <cerrno>
@@ -15,20 +17,31 @@
 
 namespace {
 
-constexpr const char kDefaultSocketPath[] = "/var/lib/phi/cli.sock";
+constexpr const char kDefaultTenant[] = "1";
 constexpr int kConnectTimeoutMs = 2000;
 constexpr int kWriteTimeoutMs = 2000;
 constexpr int kResponseTimeoutMs = 15000;
+
+bool isValidTenant(const QString &tenant)
+{
+    static const QRegularExpression pattern(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9._-]*$"));
+    return pattern.match(tenant).hasMatch();
+}
+
+QString defaultSocketPathForTenant(const QString &tenant)
+{
+    return QDir(QStringLiteral("/var/lib/phi")).filePath(QStringLiteral("@%1/cli.sock").arg(tenant));
+}
 
 void printUsage()
 {
     QTextStream out(stdout);
     out << "Usage:\n";
-    out << "  phi-cli adapter list [--socket <path>] [--json]\n";
-    out << "  phi-cli adapter start|stop|restart (--id <id> | --external-id <id> | --name <name>) [--socket <path>]\n";
-    out << "  phi-cli adapter start|stop|restart --plugin-type <type> --all [--socket <path>]\n";
-    out << "  phi-cli adapter reload --plugin-type <type> [--socket <path>]\n";
-    out << "  phi-cli transport start|stop|restart|reload --plugin-type <type> [--socket <path>]\n";
+    out << "  phi-cli adapter list [--tenant <tenant>] [--socket <path>] [--json]\n";
+    out << "  phi-cli adapter start|stop|restart (--id <id> | --external-id <id> | --name <name>) [--tenant <tenant>] [--socket <path>]\n";
+    out << "  phi-cli adapter start|stop|restart --plugin-type <type> --all [--tenant <tenant>] [--socket <path>]\n";
+    out << "  phi-cli adapter reload --plugin-type <type> [--tenant <tenant>] [--socket <path>]\n";
+    out << "  phi-cli transport start|stop|restart|reload --plugin-type <type> [--tenant <tenant>] [--socket <path>]\n";
 }
 
 bool tryReadCid(const QJsonValue &value, quint64 *cidOut)
@@ -243,7 +256,9 @@ enum class AdapterSelectorType {
 struct CliOptions {
     QString scope;
     QString action;
-    QString socketPath = QString::fromLatin1(kDefaultSocketPath);
+    QString tenant = QString::fromLatin1(kDefaultTenant);
+    QString socketPath = defaultSocketPathForTenant(QString::fromLatin1(kDefaultTenant));
+    bool socketPathExplicit = false;
     bool jsonOutput = false;
     bool all = false;
     AdapterSelectorType selectorType = AdapterSelectorType::None;
@@ -262,8 +277,36 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
     }
 
     CliOptions opts;
-    opts.scope = args.at(1);
-    opts.action = args.at(2);
+    QStringList positionalArgs;
+    positionalArgs.reserve(args.size());
+    positionalArgs.push_back(args.at(0));
+
+    for (int i = 1; i < args.size(); ++i) {
+        const QString arg = args.at(i);
+        if (arg == QStringLiteral("--tenant")) {
+            if (i + 1 >= args.size()) {
+                if (errorOut)
+                    *errorOut = QStringLiteral("Missing value for --tenant");
+                return false;
+            }
+            opts.tenant = args.at(++i).trimmed();
+            continue;
+        }
+        if (arg.startsWith(QStringLiteral("--tenant="))) {
+            opts.tenant = arg.mid(QStringLiteral("--tenant=").size()).trimmed();
+            continue;
+        }
+        positionalArgs.push_back(arg);
+    }
+
+    if (positionalArgs.size() < 3) {
+        if (errorOut)
+            *errorOut = QStringLiteral("Invalid command");
+        return false;
+    }
+
+    opts.scope = positionalArgs.at(1);
+    opts.action = positionalArgs.at(2);
     if (opts.scope != QStringLiteral("adapter") && opts.scope != QStringLiteral("transport")) {
         if (errorOut)
             *errorOut = QStringLiteral("Unknown scope: %1").arg(opts.scope);
@@ -280,31 +323,40 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
             return false;
         }
 
-        for (int i = 3; i < args.size(); ++i) {
-            const QString arg = args.at(i);
+        for (int i = 3; i < positionalArgs.size(); ++i) {
+            const QString arg = positionalArgs.at(i);
             if (arg == QStringLiteral("--socket")) {
-                if (i + 1 >= args.size()) {
+                if (i + 1 >= positionalArgs.size()) {
                     if (errorOut)
                         *errorOut = QStringLiteral("Missing value for --socket");
                     return false;
                 }
-                opts.socketPath = args.at(++i);
+                opts.socketPath = positionalArgs.at(++i);
+                opts.socketPathExplicit = true;
                 continue;
             }
             if (arg == QStringLiteral("--plugin-type")) {
-                if (i + 1 >= args.size()) {
+                if (i + 1 >= positionalArgs.size()) {
                     if (errorOut)
                         *errorOut = QStringLiteral("Missing value for --plugin-type");
                     return false;
                 }
                 opts.selectorType = AdapterSelectorType::ByPluginType;
-                opts.selectorValue = args.at(++i);
+                opts.selectorValue = positionalArgs.at(++i);
                 continue;
             }
             if (errorOut)
                 *errorOut = QStringLiteral("Unknown argument: %1").arg(arg);
             return false;
         }
+
+        if (!isValidTenant(opts.tenant)) {
+            if (errorOut)
+                *errorOut = QStringLiteral("Invalid tenant: %1").arg(opts.tenant);
+            return false;
+        }
+        if (!opts.socketPathExplicit)
+            opts.socketPath = defaultSocketPathForTenant(opts.tenant);
 
         if (opts.selectorType != AdapterSelectorType::ByPluginType || opts.selectorValue.isEmpty()) {
             if (errorOut)
@@ -331,8 +383,8 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
         return false;
     }
 
-    for (int i = 3; i < args.size(); ++i) {
-        const QString arg = args.at(i);
+    for (int i = 3; i < positionalArgs.size(); ++i) {
+        const QString arg = positionalArgs.at(i);
         if (arg == QStringLiteral("--json")) {
             opts.jsonOutput = true;
             continue;
@@ -342,16 +394,17 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
             continue;
         }
         if (arg == QStringLiteral("--socket")) {
-            if (i + 1 >= args.size()) {
+            if (i + 1 >= positionalArgs.size()) {
                 if (errorOut)
                     *errorOut = QStringLiteral("Missing value for --socket");
                 return false;
             }
-            opts.socketPath = args.at(++i);
+            opts.socketPath = positionalArgs.at(++i);
+            opts.socketPathExplicit = true;
             continue;
         }
         if (arg == QStringLiteral("--id")) {
-            if (i + 1 >= args.size() || !parseInt(args.at(i + 1), &opts.adapterId)) {
+            if (i + 1 >= positionalArgs.size() || !parseInt(positionalArgs.at(i + 1), &opts.adapterId)) {
                 if (errorOut)
                     *errorOut = QStringLiteral("Invalid value for --id");
                 return false;
@@ -361,33 +414,33 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
             continue;
         }
         if (arg == QStringLiteral("--external-id")) {
-            if (i + 1 >= args.size()) {
+            if (i + 1 >= positionalArgs.size()) {
                 if (errorOut)
                     *errorOut = QStringLiteral("Missing value for --external-id");
                 return false;
             }
             opts.selectorType = AdapterSelectorType::ByExternalId;
-            opts.selectorValue = args.at(++i);
+            opts.selectorValue = positionalArgs.at(++i);
             continue;
         }
         if (arg == QStringLiteral("--name")) {
-            if (i + 1 >= args.size()) {
+            if (i + 1 >= positionalArgs.size()) {
                 if (errorOut)
                     *errorOut = QStringLiteral("Missing value for --name");
                 return false;
             }
             opts.selectorType = AdapterSelectorType::ByName;
-            opts.selectorValue = args.at(++i);
+            opts.selectorValue = positionalArgs.at(++i);
             continue;
         }
         if (arg == QStringLiteral("--plugin-type")) {
-            if (i + 1 >= args.size()) {
+            if (i + 1 >= positionalArgs.size()) {
                 if (errorOut)
                     *errorOut = QStringLiteral("Missing value for --plugin-type");
                 return false;
             }
             opts.selectorType = AdapterSelectorType::ByPluginType;
-            opts.selectorValue = args.at(++i);
+            opts.selectorValue = positionalArgs.at(++i);
             continue;
         }
         if (errorOut)
@@ -437,6 +490,14 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
             return false;
         }
     }
+
+    if (!isValidTenant(opts.tenant)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("Invalid tenant: %1").arg(opts.tenant);
+        return false;
+    }
+    if (!opts.socketPathExplicit)
+        opts.socketPath = defaultSocketPathForTenant(opts.tenant);
 
     *optsOut = opts;
     return true;

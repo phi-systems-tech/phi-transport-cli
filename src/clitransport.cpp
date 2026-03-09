@@ -25,7 +25,7 @@ constexpr const char kTopicCmdResponse[] = "cmd.response";
 constexpr const char kTopicSyncResponse[] = "sync.response";
 constexpr const char kTopicProtocolError[] = "protocol.error";
 
-constexpr const char kDefaultSocketPath[] = "/var/lib/phi/cli.sock";
+constexpr const char kDefaultSocketPath[] = "/var/lib/phi/@1/cli.sock";
 
 } // namespace
 

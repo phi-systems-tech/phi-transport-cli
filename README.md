@@ -8,7 +8,7 @@ CLI transport plugin for `phi-core`.
 
 - Local command-line transport (`cli`).
 - Server-side plugin used by `phi-core`.
-- Unix domain socket endpoint (default: `/var/lib/phi/cli.sock`).
+- Unix domain socket endpoint (default: `/var/lib/phi/@1/cli.sock`).
 
 ## Network Exposure
 
@@ -19,7 +19,7 @@ CLI transport plugin for `phi-core`.
 
 - Authentication is validated by `phi-core`.
 - Tokens and session handling follow the shared transport contract.
-- The CLI socket is a local Unix socket (`/var/lib/phi/cli.sock`) with permissions
+- The CLI socket is a local Unix socket (`/var/lib/phi/@1/cli.sock`) with permissions
   `srw-rw----` owned by `phi:phi` by default; access is therefore limited to user
   `phi` and members of group `phi`.
 - When invoked as root, `phi-cli` drops privileges to the `phi` user before
@@ -91,9 +91,9 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 
 - Runtime config is passed in by `phi-core`.
 - `phi-core` resolves that transport config in two layers:
-  - `/etc/phi/transports/cli.json` as the default base config
-  - `/var/lib/phi/transports/cli/current/config.json` as the runtime override
-- The `phi-transport-cli` Debian package provides `/etc/phi/transports/cli.json`
+  - `/etc/phi/@1/transports/cli.json` as the default base config
+  - `/var/lib/phi/@1/transports/cli/current/config.json` as the runtime override
+- The `phi-transport-cli` Debian package provides `/etc/phi/@1/transports/cli.json`
   with the default Unix socket path.
 
 ### Build
@@ -107,8 +107,9 @@ cmake --build ../build/phi-transport-cli/release-ninja --parallel
 
 ```bash
 phi-cli adapter list
+phi-cli adapter list --tenant 2
 phi-cli adapter list --json
-phi-cli adapter list --socket /var/lib/phi/cli.sock
+phi-cli adapter list --socket /var/lib/phi/@1/cli.sock
 phi-cli adapter restart --id 42
 phi-cli adapter restart --external-id hue-bridge-main
 phi-cli adapter restart --name "Living Room"
@@ -116,7 +117,7 @@ phi-cli adapter restart --plugin-type hue --all
 phi-cli adapter reload --plugin-type hue
 phi-cli transport restart --plugin-type ws
 phi-cli transport reload --plugin-type cli
-scripts/check-phi-cli-runtime.sh /var/lib/phi/cli.sock
+scripts/check-phi-cli-runtime.sh /var/lib/phi/@1/cli.sock
 ```
 
 Selector rules (aligned to `phi-transport-api/PROTOCOLL.md`):
