@@ -89,7 +89,12 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 
 ### Configuration
 
-- Configuration keys are transport-specific and currently minimal.
+- Runtime config is passed in by `phi-core`.
+- `phi-core` resolves that transport config in two layers:
+  - `/etc/phi/transports/cli.json` as the default base config
+  - `/var/lib/phi/transports/cli/current/config.json` as the runtime override
+- The `phi-transport-cli` Debian package provides `/etc/phi/transports/cli.json`
+  with the default Unix socket path.
 
 ### Build
 

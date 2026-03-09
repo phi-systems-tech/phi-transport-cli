@@ -1,0 +1,4 @@
+usr/lib/*/phi/plugins/transports/libphi_transport_cli.so
+usr/lib/*/phi/plugins/transports/libphi_transport_cli.so usr/lib/phi/plugins/transports/
+usr/bin/phi-cli
+debian/cli.json etc/phi/transports/

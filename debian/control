@@ -1,0 +1,21 @@
+Source: phi-transport-cli
+Section: net
+Priority: optional
+Maintainer: Marius Schumacher <marius.schumacher@phisys.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ cmake,
+ ninja-build,
+ qt6-base-dev,
+ phi-transport-api-dev
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://phisys.com
+
+Package: phi-transport-cli
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends}
+Description: PHI CLI transport plugin and local client
+ CLI transport module for phi-core plus the local phi-cli utility.

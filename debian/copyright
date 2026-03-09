@@ -1,0 +1,13 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: phi-transport-cli
+Source: https://phisys.com
+
+Files: *
+Copyright: 2026 Phisys Ltd. (Switzerland)
+License: Phisys-NonCommercial
+ Free for private and non-commercial use. Schools, universities, and
+ non-profit organizations are treated as private/non-commercial users.
+ Redistribution is permitted when notices are retained. Commercial use
+ requires a separate commercial license.
+ .
+ See LICENSE in the source tree for full terms.

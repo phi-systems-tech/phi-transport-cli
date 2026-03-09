@@ -6,6 +6,7 @@ debian/debhelper-build-stamp
 debian/files
 debian/*.debhelper.log
 debian/*.substvars
+debian/phi-transport-cli/
 debian/*/DEBIAN/
 debian/*/usr/
 
