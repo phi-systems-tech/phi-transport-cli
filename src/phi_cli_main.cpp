@@ -21,6 +21,7 @@ constexpr const char kDefaultTenant[] = "1";
 constexpr int kConnectTimeoutMs = 2000;
 constexpr int kWriteTimeoutMs = 2000;
 constexpr int kResponseTimeoutMs = 15000;
+constexpr int kDiscoveryTimeoutMs = 30000;
 
 bool isValidTenant(const QString &tenant)
 {
@@ -38,6 +39,7 @@ void printUsage()
     QTextStream out(stdout);
     out << "Usage:\n";
     out << "  phi-cli adapter list [--tenant <tenant>] [--socket <path>] [--json]\n";
+    out << "  phi-cli adapter discover [<plugin>] [--tenant <tenant>] [--socket <path>] [--json]\n";
     out << "  phi-cli adapter start|stop|restart (--id <id> | --external-id <id> | --name <name>) [--tenant <tenant>] [--socket <path>]\n";
     out << "  phi-cli adapter start|stop|restart <plugin> --all [--tenant <tenant>] [--socket <path>]\n";
     out << "  phi-cli adapter reload <plugin> [--tenant <tenant>] [--socket <path>]\n";
@@ -106,6 +108,56 @@ void printAdapterTable(const QJsonArray &adapters)
         out << name;
         out.setFieldWidth(10);
         out << connected;
+        out.setFieldWidth(0);
+        out << "\n";
+    }
+}
+
+void printDiscoveryTable(const QJsonArray &candidates)
+{
+    QTextStream out(stdout);
+    out.setFieldAlignment(QTextStream::AlignLeft);
+    out.setFieldWidth(16);
+    out << "PLUGIN";
+    out.setFieldWidth(28);
+    out << "LABEL";
+    out.setFieldWidth(22);
+    out << "DISCOVERED_ID";
+    out.setFieldWidth(24);
+    out << "HOST";
+    out.setFieldWidth(18);
+    out << "IP";
+    out.setFieldWidth(8);
+    out << "PORT";
+    out.setFieldWidth(12);
+    out << "KIND";
+    out.setFieldWidth(0);
+    out << "\n";
+
+    for (const QJsonValue &entry : candidates) {
+        const QJsonObject obj = entry.toObject();
+        const QString pluginType = obj.value(QStringLiteral("pluginType")).toString();
+        const QString label = obj.value(QStringLiteral("label")).toString();
+        const QString discoveredId = obj.value(QStringLiteral("discoveredExternalId")).toString();
+        const QString host = obj.value(QStringLiteral("hostname")).toString();
+        const QString ip = obj.value(QStringLiteral("ip")).toString();
+        const QString port = obj.value(QStringLiteral("port")).toVariant().toString();
+        const QString kind = obj.value(QStringLiteral("kind")).toString();
+
+        out.setFieldWidth(16);
+        out << pluginType;
+        out.setFieldWidth(28);
+        out << label;
+        out.setFieldWidth(22);
+        out << discoveredId;
+        out.setFieldWidth(24);
+        out << host;
+        out.setFieldWidth(18);
+        out << ip;
+        out.setFieldWidth(8);
+        out << port;
+        out.setFieldWidth(12);
+        out << kind;
         out.setFieldWidth(0);
         out << "\n";
     }
@@ -232,6 +284,152 @@ bool fetchAdapters(const QString &socketPath, QJsonArray *adaptersOut, QString *
     if (adaptersOut)
         *adaptersOut = response.value(QStringLiteral("adapters")).toArray();
     return true;
+}
+
+bool runDiscoveryStream(const QString &socketPath,
+                        const QStringList &pluginTypes,
+                        QJsonArray *candidatesOut,
+                        QString *errorOut)
+{
+    QLocalSocket socket;
+    socket.connectToServer(socketPath);
+    if (!socket.waitForConnected(kConnectTimeoutMs)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("Failed to connect to socket: %1").arg(socketPath);
+        return false;
+    }
+
+    const quint64 cid = static_cast<quint64>(QDateTime::currentMSecsSinceEpoch());
+
+    QJsonObject params;
+    if (!pluginTypes.isEmpty()) {
+        QJsonArray pluginArray;
+        for (const QString &pluginType : pluginTypes)
+            pluginArray.append(pluginType);
+        params.insert(QStringLiteral("pluginTypes"), pluginArray);
+    }
+
+    QJsonObject payload;
+    payload.insert(QStringLiteral("adapterId"), 0);
+    payload.insert(QStringLiteral("kind"), QStringLiteral("adapter.discover"));
+    payload.insert(QStringLiteral("params"), params);
+
+    QJsonObject request;
+    request.insert(QStringLiteral("type"), QStringLiteral("cmd"));
+    request.insert(QStringLiteral("cid"), static_cast<qint64>(cid));
+    request.insert(QStringLiteral("topic"), QStringLiteral("cmd.adapters.stream.start"));
+    request.insert(QStringLiteral("payload"), payload);
+
+    const QByteArray wire = QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n';
+    socket.write(wire);
+    if (!socket.waitForBytesWritten(kWriteTimeoutMs)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("Failed to send request");
+        return false;
+    }
+
+    QByteArray buffer;
+    QString streamId;
+    QJsonArray candidates;
+    const qint64 deadlineMs = QDateTime::currentMSecsSinceEpoch() + kDiscoveryTimeoutMs;
+
+    auto remainingMs = [&]() -> int {
+        return static_cast<int>(qMax<qint64>(1, deadlineMs - QDateTime::currentMSecsSinceEpoch()));
+    };
+
+    while (QDateTime::currentMSecsSinceEpoch() < deadlineMs) {
+        if (!socket.waitForReadyRead(remainingMs())) {
+            if (errorOut)
+                *errorOut = QStringLiteral("Timeout waiting for discovery stream");
+            return false;
+        }
+        buffer.append(socket.readAll());
+
+        while (true) {
+            const int newlinePos = buffer.indexOf('\n');
+            if (newlinePos < 0)
+                break;
+            const QByteArray line = buffer.left(newlinePos).trimmed();
+            buffer.remove(0, newlinePos + 1);
+            if (line.isEmpty())
+                continue;
+
+            QJsonParseError parseError;
+            const QJsonDocument doc = QJsonDocument::fromJson(line, &parseError);
+            if (parseError.error != QJsonParseError::NoError || !doc.isObject())
+                continue;
+
+            const QJsonObject obj = doc.object();
+            const QString type = obj.value(QStringLiteral("type")).toString();
+            const QString topic = obj.value(QStringLiteral("topic")).toString();
+            const QJsonObject response = obj.value(QStringLiteral("payload")).toObject();
+
+            quint64 responseCid = 0;
+            const bool cidMatches = tryReadCid(obj.value(QStringLiteral("cid")), &responseCid) && responseCid == cid;
+
+            if (type == QStringLiteral("response") && topic == QStringLiteral("cmd.ack") && cidMatches) {
+                if (!response.value(QStringLiteral("accepted")).toBool()) {
+                    if (errorOut) {
+                        const QString err = responseErrorMessage(response);
+                        *errorOut = QStringLiteral("Command rejected: %1")
+                                        .arg(err.isEmpty() ? QStringLiteral("unknown error") : err);
+                    }
+                    return false;
+                }
+                continue;
+            }
+
+            if (type == QStringLiteral("response") && topic == QStringLiteral("cmd.response") && cidMatches) {
+                streamId = response.value(QStringLiteral("streamId")).toString().trimmed();
+                if (streamId.isEmpty()) {
+                    if (errorOut)
+                        *errorOut = QStringLiteral("Discovery response did not include a streamId");
+                    return false;
+                }
+                continue;
+            }
+
+            if (type == QStringLiteral("error") && topic == QStringLiteral("protocol.error")) {
+                if (errorOut)
+                    *errorOut = QStringLiteral("Protocol error: %1")
+                                    .arg(response.value(QStringLiteral("message")).toString());
+                return false;
+            }
+
+            if (streamId.isEmpty())
+                continue;
+
+            const QString payloadStreamId = response.value(QStringLiteral("streamId")).toString().trimmed();
+            const QString payloadCmd = response.value(QStringLiteral("cmd")).toString();
+            if (payloadStreamId != streamId || payloadCmd != QStringLiteral("cmd.adapters.stream.start"))
+                continue;
+
+            if (type == QStringLiteral("event") && topic == QStringLiteral("stream.data")) {
+                candidates.append(response);
+                continue;
+            }
+
+            if (type == QStringLiteral("event") && topic == QStringLiteral("stream.error")) {
+                if (errorOut) {
+                    const QString err = responseErrorMessage(response);
+                    *errorOut = err.isEmpty()
+                        ? QStringLiteral("Discovery stream failed")
+                        : err;
+                }
+                return false;
+            }
+
+            if (type == QStringLiteral("event") && topic == QStringLiteral("stream.end")) {
+                if (candidatesOut)
+                    *candidatesOut = candidates;
+                return true;
+            }
+        }
+    }
+
+    if (errorOut)
+        *errorOut = QStringLiteral("Timeout waiting for discovery stream");
+    return false;
 }
 
 bool parseInt(const QString &input, int *out)
@@ -374,6 +572,7 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
     }
 
     if (opts.action != QStringLiteral("list")
+        && opts.action != QStringLiteral("discover")
         && opts.action != QStringLiteral("start")
         && opts.action != QStringLiteral("stop")
         && opts.action != QStringLiteral("restart")
@@ -453,6 +652,18 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
                 *errorOut = QStringLiteral("adapter list does not support selectors or --all");
             return false;
         }
+    } else if (opts.action == QStringLiteral("discover")) {
+        if (opts.selectorType != AdapterSelectorType::None
+            && opts.selectorType != AdapterSelectorType::ByPluginType) {
+            if (errorOut)
+                *errorOut = QStringLiteral("adapter discover supports at most one optional <plugin> filter");
+            return false;
+        }
+        if (opts.all) {
+            if (errorOut)
+                *errorOut = QStringLiteral("adapter discover does not support --all");
+            return false;
+        }
     } else if (opts.action == QStringLiteral("reload")) {
         if (opts.selectorType != AdapterSelectorType::ByPluginType || opts.selectorValue.isEmpty()) {
             if (errorOut)
@@ -485,7 +696,7 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
         }
         if (opts.jsonOutput) {
             if (errorOut)
-                *errorOut = QStringLiteral("--json is only supported with adapter list");
+                *errorOut = QStringLiteral("--json is only supported with adapter list or adapter discover");
             return false;
         }
     }
@@ -640,6 +851,24 @@ int main(int argc, char **argv)
             QTextStream(stdout) << QString::fromUtf8(QJsonDocument(adapters).toJson(QJsonDocument::Indented));
         else
             printAdapterTable(adapters);
+        return 0;
+    }
+
+    if (opts.action == QStringLiteral("discover")) {
+        QStringList pluginTypes;
+        if (opts.selectorType == AdapterSelectorType::ByPluginType && !opts.selectorValue.isEmpty())
+            pluginTypes.push_back(opts.selectorValue);
+
+        QJsonArray candidates;
+        QString error;
+        if (!runDiscoveryStream(opts.socketPath, pluginTypes, &candidates, &error)) {
+            QTextStream(stderr) << error << "\n";
+            return 1;
+        }
+        if (opts.jsonOutput)
+            QTextStream(stdout) << QString::fromUtf8(QJsonDocument(candidates).toJson(QJsonDocument::Indented));
+        else
+            printDiscoveryTable(candidates);
         return 0;
     }
 
