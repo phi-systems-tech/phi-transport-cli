@@ -120,10 +120,12 @@ void printDiscoveryTable(const QJsonArray &candidates)
     out.setFieldAlignment(QTextStream::AlignLeft);
     out.setFieldWidth(16);
     out << "PLUGIN";
+    out.setFieldWidth(12);
+    out << "PROVIDER";
     out.setFieldWidth(28);
     out << "LABEL";
     out.setFieldWidth(22);
-    out << "DISCOVERED_ID";
+    out << "EXTERNAL_ID";
     out.setFieldWidth(24);
     out << "HOST";
     out.setFieldWidth(18);
@@ -131,26 +133,29 @@ void printDiscoveryTable(const QJsonArray &candidates)
     out.setFieldWidth(8);
     out << "PORT";
     out.setFieldWidth(12);
-    out << "KIND";
+    out << "SERVICE";
     out.setFieldWidth(0);
     out << "\n";
 
     for (const QJsonValue &entry : candidates) {
         const QJsonObject obj = entry.toObject();
-        const QString pluginType = obj.value(QStringLiteral("pluginType")).toString();
+        const QString plugin = obj.value(QStringLiteral("plugin")).toString();
+        const QString provider = obj.value(QStringLiteral("provider")).toString();
         const QString label = obj.value(QStringLiteral("label")).toString();
-        const QString discoveredId = obj.value(QStringLiteral("discoveredExternalId")).toString();
+        const QString externalId = obj.value(QStringLiteral("externalId")).toString();
         const QString host = obj.value(QStringLiteral("hostname")).toString();
         const QString ip = obj.value(QStringLiteral("ip")).toString();
         const QString port = obj.value(QStringLiteral("port")).toVariant().toString();
-        const QString kind = obj.value(QStringLiteral("kind")).toString();
+        const QString service = obj.value(QStringLiteral("service")).toString();
 
         out.setFieldWidth(16);
-        out << pluginType;
+        out << plugin;
+        out.setFieldWidth(12);
+        out << provider;
         out.setFieldWidth(28);
         out << label;
         out.setFieldWidth(22);
-        out << discoveredId;
+        out << externalId;
         out.setFieldWidth(24);
         out << host;
         out.setFieldWidth(18);
@@ -158,7 +163,7 @@ void printDiscoveryTable(const QJsonArray &candidates)
         out.setFieldWidth(8);
         out << port;
         out.setFieldWidth(12);
-        out << kind;
+        out << service;
         out.setFieldWidth(0);
         out << "\n";
     }
