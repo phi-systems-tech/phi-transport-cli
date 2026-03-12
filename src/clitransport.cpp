@@ -232,7 +232,7 @@ QJsonObject CliTransport::makeAckPayload(bool accepted,
     } else {
         QJsonObject err;
         err.insert(QStringLiteral("code"), errorCode);
-        err.insert(QStringLiteral("msg"), errorMsg);
+        err.insert(QStringLiteral("message"), errorMsg);
         payload.insert(QStringLiteral("error"), err);
     }
     return payload;
@@ -388,11 +388,11 @@ void CliTransport::handleCommand(QLocalSocket *socket,
         if (result.accepted) {
             sendSyncResponse(socket, cid, topic, result.payload);
         } else {
-            const QString err = result.error.has_value() ? result.error->msg : QStringLiteral("Sync call rejected");
+            const QString err = result.error.has_value() ? result.error->message : QStringLiteral("Sync call rejected");
             QJsonObject out;
             out.insert(QStringLiteral("accepted"), false);
             QJsonObject errObj;
-            errObj.insert(QStringLiteral("msg"), err);
+            errObj.insert(QStringLiteral("message"), err);
             if (result.error.has_value() && !result.error->ctx.isEmpty())
                 errObj.insert(QStringLiteral("ctx"), result.error->ctx);
             out.insert(QStringLiteral("error"), errObj);
@@ -420,11 +420,11 @@ void CliTransport::handleCommand(QLocalSocket *socket,
 
     const bool asyncUnsupportedTopic =
         asyncSubmit.error.has_value()
-        && asyncSubmit.error->msg == QStringLiteral("Unsupported async topic");
+        && asyncSubmit.error->message == QStringLiteral("Unsupported async topic");
     if (!asyncUnsupportedTopic) {
         const QString asyncErr =
-            asyncSubmit.error.has_value() && !asyncSubmit.error->msg.isEmpty()
-                ? asyncSubmit.error->msg
+            asyncSubmit.error.has_value() && !asyncSubmit.error->message.isEmpty()
+                ? asyncSubmit.error->message
                 : QStringLiteral("Command rejected");
         sendAck(socket, cid, false, topic, asyncErr);
         return;
@@ -439,7 +439,7 @@ void CliTransport::handleCommand(QLocalSocket *socket,
 
     const bool unknownTopic =
         syncResult.error.has_value()
-        && syncResult.error->msg == QStringLiteral("Unsupported sync topic");
+        && syncResult.error->message == QStringLiteral("Unsupported sync topic");
 
     if (unknownTopic) {
         sendProtocolError(socket, cid, QStringLiteral("unknown_topic"),
@@ -448,10 +448,10 @@ void CliTransport::handleCommand(QLocalSocket *socket,
     }
 
     const QString errorMsg =
-        syncResult.error.has_value() && !syncResult.error->msg.isEmpty()
-            ? syncResult.error->msg
-            : (asyncSubmit.error.has_value() && !asyncSubmit.error->msg.isEmpty()
-                   ? asyncSubmit.error->msg
+        syncResult.error.has_value() && !syncResult.error->message.isEmpty()
+            ? syncResult.error->message
+            : (asyncSubmit.error.has_value() && !asyncSubmit.error->message.isEmpty()
+                   ? asyncSubmit.error->message
                    : QStringLiteral("Command rejected"));
     sendAck(socket, cid, false, topic, errorMsg);
 }
