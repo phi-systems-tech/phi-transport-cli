@@ -148,7 +148,11 @@ Selector rules (aligned to `phi-transport-api/PROTOCOLL.md`):
 
 ### Observability
 
-- Logging category names will be documented with implementation.
+- Transport runtime logs are emitted as structured `LogEntry` records via the
+  shared `phi-core` logging pipeline.
+- Do not add Qt logging categories as a transport-local fallback path.
+- The standalone `phi-cli` binary may still write user-facing command errors to
+  its own stderr; that is separate from plugin runtime logging.
 
 ### Troubleshooting
 

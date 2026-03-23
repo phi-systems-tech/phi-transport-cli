@@ -7,9 +7,6 @@
 #include <QJsonParseError>
 #include <QLocalServer>
 #include <QLocalSocket>
-#include <QLoggingCategory>
-
-Q_LOGGING_CATEGORY(cliTransportLog, "phi-transport.cli")
 
 namespace phicore::transport::cli {
 
@@ -71,8 +68,14 @@ bool CliTransport::start(const QJsonObject &config, QString *errorString)
 
     m_socketPath = socketPath;
     m_running = true;
-    qCInfo(cliTransportLog).noquote()
-        << tr("CLI transport started on unix socket %1").arg(m_socketPath);
+    QJsonObject fields;
+    fields.insert(QStringLiteral("socketPath"), m_socketPath);
+    writeLog(LogLevel::Info,
+             makeCategory(LogCategory::Transport),
+             QByteArrayLiteral("CLI transport started on unix socket %1"),
+             QVariantList{m_socketPath},
+             QByteArrayLiteral("cli.start"),
+             fields);
     return true;
 }
 
@@ -103,8 +106,14 @@ void CliTransport::onCoreAsyncResult(CmdId cmdId, const QJsonObject &payload)
 {
     auto it = m_pendingCommands.find(cmdId);
     if (it == m_pendingCommands.end()) {
-        qCWarning(cliTransportLog).noquote()
-            << tr("No pending CLI command for cmdId=%1").arg(static_cast<qulonglong>(cmdId));
+        QJsonObject fields;
+        fields.insert(QStringLiteral("cmdId"), static_cast<qint64>(cmdId));
+        writeLog(LogLevel::Warn,
+                 makeCategory(LogCategory::Transport),
+                 QByteArrayLiteral("No pending CLI command for cmdId=%1"),
+                 QVariantList{static_cast<qulonglong>(cmdId)},
+                 QByteArrayLiteral("cli.asyncResultMissing"),
+                 fields);
         return;
     }
 
