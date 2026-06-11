@@ -1,3 +1,9 @@
+phi-transport-cli (0.0~git20260611.787a7bd-1) trixie; urgency=medium
+
+  * Route CLI transport logs through core logging.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Thu, 11 Jun 2026 23:27:48 +0200
+
 phi-transport-cli (0.0~git20260308-1) trixie; urgency=medium
 
   * Initial Debian packaging for phi-transport-cli.
