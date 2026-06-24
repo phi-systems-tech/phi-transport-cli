@@ -87,6 +87,10 @@ void printAdapterTable(const QJsonArray &adapters)
     out.setFieldWidth(28);
     out << "NAME";
     out.setFieldWidth(10);
+    out << "ENABLED";
+    out.setFieldWidth(10);
+    out << "RUNNING";
+    out.setFieldWidth(10);
     out << "CONNECTED";
     out.setFieldWidth(0);
     out << "\n";
@@ -97,6 +101,8 @@ void printAdapterTable(const QJsonArray &adapters)
         const QString pluginType = obj.value(QStringLiteral("pluginType")).toString();
         const QString externalId = obj.value(QStringLiteral("externalId")).toString();
         const QString name = obj.value(QStringLiteral("name")).toString();
+        const QString enabled = boolText(obj.value(QStringLiteral("enabled")).toBool(false));
+        const QString running = boolText(obj.value(QStringLiteral("running")).toBool(false));
         const QString connected = boolText(obj.value(QStringLiteral("connected")).toBool(false));
 
         out.setFieldWidth(8);
@@ -107,6 +113,10 @@ void printAdapterTable(const QJsonArray &adapters)
         out << externalId;
         out.setFieldWidth(28);
         out << name;
+        out.setFieldWidth(10);
+        out << enabled;
+        out.setFieldWidth(10);
+        out << running;
         out.setFieldWidth(10);
         out << connected;
         out.setFieldWidth(0);
