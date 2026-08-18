@@ -44,6 +44,7 @@ void printUsage()
     out << "  phi-cli adapter start|stop|restart (--id <id> | --external-id <id> | --name <name>) [--tenant <tenant>] [--socket <path>]\n";
     out << "  phi-cli adapter start|stop|restart <plugin> --all [--tenant <tenant>] [--socket <path>]\n";
     out << "  phi-cli adapter reload <plugin> [--tenant <tenant>] [--socket <path>]\n";
+    out << "  phi-cli adapter invoke <actionId> (--id <id> | --external-id <id> | --name <name>) [--params <json>] [--json] [--tenant <tenant>] [--socket <path>]\n";
     out << "  phi-cli transport start|stop|restart|reload <plugin> [--tenant <tenant>] [--socket <path>]\n";
 }
 
@@ -487,6 +488,8 @@ struct CliOptions {
     AdapterSelectorType selectorType = AdapterSelectorType::None;
     int adapterId = 0;
     QString selectorValue;
+    QString invokeActionId;
+    QString invokeParamsJson;
 };
 
 bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *errorOut)
@@ -646,7 +649,8 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
         && opts.action != QStringLiteral("start")
         && opts.action != QStringLiteral("stop")
         && opts.action != QStringLiteral("restart")
-        && opts.action != QStringLiteral("reload")) {
+        && opts.action != QStringLiteral("reload")
+        && opts.action != QStringLiteral("invoke")) {
         if (errorOut)
             *errorOut = QStringLiteral("Unknown action: %1").arg(opts.action);
         return false;
@@ -702,6 +706,15 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
             opts.selectorValue = positionalArgs.at(++i);
             continue;
         }
+        if (arg == QStringLiteral("--params")) {
+            if (i + 1 >= positionalArgs.size()) {
+                if (errorOut)
+                    *errorOut = QStringLiteral("Missing value for --params");
+                return false;
+            }
+            opts.invokeParamsJson = positionalArgs.at(++i);
+            continue;
+        }
         if (!arg.startsWith(QLatin1Char('-')) && positionalPluginType.isEmpty()) {
             positionalPluginType = arg;
             continue;
@@ -709,6 +722,12 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
         if (errorOut)
             *errorOut = QStringLiteral("Unknown argument: %1").arg(arg);
         return false;
+    }
+
+    if (opts.action == QStringLiteral("invoke")) {
+        // For invoke the positional argument is the action id, not a plugin type.
+        opts.invokeActionId = positionalPluginType.trimmed();
+        positionalPluginType.clear();
     }
 
     if (opts.selectorType == AdapterSelectorType::None && !positionalPluginType.isEmpty()) {
@@ -743,6 +762,24 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
         if (opts.all || opts.jsonOutput) {
             if (errorOut)
                 *errorOut = QStringLiteral("adapter reload does not support --all or --json");
+            return false;
+        }
+    } else if (opts.action == QStringLiteral("invoke")) {
+        if (opts.invokeActionId.isEmpty()) {
+            if (errorOut)
+                *errorOut = QStringLiteral("adapter invoke requires <actionId>");
+            return false;
+        }
+        if (opts.selectorType != AdapterSelectorType::ById
+            && opts.selectorType != AdapterSelectorType::ByExternalId
+            && opts.selectorType != AdapterSelectorType::ByName) {
+            if (errorOut)
+                *errorOut = QStringLiteral("adapter invoke requires one selector (--id, --external-id, or --name)");
+            return false;
+        }
+        if (opts.all) {
+            if (errorOut)
+                *errorOut = QStringLiteral("adapter invoke does not support --all");
             return false;
         }
     } else {
@@ -982,6 +1019,77 @@ int main(int argc, char **argv)
         }
         QTextStream(stdout) << "Reload triggered for pluginType '" << opts.selectorValue << "'\n";
         return 0;
+    }
+
+    if (opts.action == QStringLiteral("invoke")) {
+        QJsonObject params;
+        if (!opts.invokeParamsJson.trimmed().isEmpty()) {
+            QJsonParseError parseError;
+            const QJsonDocument doc = QJsonDocument::fromJson(opts.invokeParamsJson.toUtf8(), &parseError);
+            if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+                QTextStream(stderr) << "Invalid --params: expected a JSON object\n";
+                return 2;
+            }
+            params = doc.object();
+        }
+
+        QJsonArray adapters;
+        QString listError;
+        if (!fetchAdapters(opts.socketPath, &adapters, &listError)) {
+            QTextStream(stderr) << listError << "\n";
+            return 1;
+        }
+        QString resolveError;
+        const QList<int> ids = resolveAdapterIds(opts, adapters, &resolveError);
+        if (!resolveError.isEmpty()) {
+            QTextStream(stderr) << resolveError << "\n";
+            return 1;
+        }
+        if (ids.size() != 1) {
+            QTextStream(stderr) << "adapter invoke requires exactly one matching adapter (matched "
+                                << ids.size() << ")\n";
+            return 1;
+        }
+
+        QJsonObject payload;
+        payload.insert(QStringLiteral("scope"), QStringLiteral("instance"));
+        payload.insert(QStringLiteral("adapterId"), ids.first());
+        payload.insert(QStringLiteral("actionId"), opts.invokeActionId);
+        payload.insert(QStringLiteral("params"), params);
+
+        QJsonObject response;
+        QString error;
+        if (!sendCommand(opts.socketPath, QStringLiteral("cmd.adapter.action.invoke"), payload,
+                         &response, &error)) {
+            QTextStream(stderr) << error << "\n";
+            return 1;
+        }
+
+        const int status = response.value(QStringLiteral("status")).toInt(-1);
+        if (opts.jsonOutput) {
+            QTextStream(stdout) << QString::fromUtf8(QJsonDocument(response).toJson(QJsonDocument::Indented));
+        } else {
+            QTextStream out(stdout);
+            out << "status: " << response.value(QStringLiteral("statusName")).toString(QStringLiteral("unknown"))
+                << " (" << status << ")\n";
+            const QJsonValue resultValue = response.value(QStringLiteral("resultValue"));
+            if (!resultValue.isUndefined() && !resultValue.isNull()) {
+                if (resultValue.isObject() || resultValue.isArray()) {
+                    const QJsonDocument doc = resultValue.isObject()
+                        ? QJsonDocument(resultValue.toObject())
+                        : QJsonDocument(resultValue.toArray());
+                    out << "result: " << QString::fromUtf8(doc.toJson(QJsonDocument::Compact)) << "\n";
+                } else {
+                    out << "result: " << resultValue.toVariant().toString() << "\n";
+                }
+            }
+            const QJsonValue errorValue = response.value(QStringLiteral("error"));
+            if (errorValue.isObject()) {
+                out << "error: "
+                    << errorValue.toObject().value(QStringLiteral("message")).toString() << "\n";
+            }
+        }
+        return status == 0 ? 0 : 1;
     }
 
     QJsonArray adapters;
