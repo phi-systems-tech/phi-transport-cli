@@ -1,3 +1,9 @@
+phi-transport-cli (0.0~git20260818.37eea1f-1) trixie; urgency=medium
+
+  * Add phi-cli adapter invoke for generic adapter actions.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Tue, 18 Aug 2026 19:16:32 +0200
+
 phi-transport-cli (0.0~git20260611.787a7bd-1) trixie; urgency=medium
 
   * Route CLI transport logs through core logging.
