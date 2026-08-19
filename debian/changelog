@@ -1,3 +1,10 @@
+phi-transport-cli (0.0~git202608192219.692f85e-1) trixie; urgency=medium
+
+  * Derive from the new TransportPluginBase and report kTransportApiVersion, so
+    phi-core's transport version gate accepts this build (F-38).
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Wed, 19 Aug 2026 22:19:06 +0200
+
 phi-transport-cli (0.0~git20260818.37eea1f-1) trixie; urgency=medium
 
   * Add phi-cli adapter invoke for generic adapter actions.
