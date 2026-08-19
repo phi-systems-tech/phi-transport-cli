@@ -27,7 +27,7 @@ constexpr const char kDefaultSocketPath[] = "/var/lib/phi/@1/cli.sock";
 } // namespace
 
 CliTransport::CliTransport(QObject *parent)
-    : TransportInterface(parent)
+    : TransportPluginBase(parent)
 {
 }
 
@@ -44,11 +44,6 @@ QString CliTransport::displayName() const
 QString CliTransport::description() const
 {
     return QStringLiteral("Unix socket transport plugin for local CLI access.");
-}
-
-QString CliTransport::apiVersion() const
-{
-    return QStringLiteral("1.0.0");
 }
 
 bool CliTransport::start(const QJsonObject &config, QString *errorString)
