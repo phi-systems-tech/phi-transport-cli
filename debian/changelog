@@ -1,3 +1,11 @@
+phi-transport-cli (0.0~git202608192352.d7ac1cd-1) trixie; urgency=medium
+
+  * Assemble envelopes from UTF-8 JSON text: the transport API data path is text, so
+    a forwarded event is no longer re-parsed on its way to the wire.
+  * Rebuild against phi-transport-api 1.2.0.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Wed, 19 Aug 2026 23:52:07 +0200
+
 phi-transport-cli (0.0~git202608192219.692f85e-1) trixie; urgency=medium
 
   * Derive from the new TransportPluginBase and report kTransportApiVersion, so
