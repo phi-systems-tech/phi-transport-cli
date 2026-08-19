@@ -7,7 +7,7 @@ Build-Depends:
  cmake,
  ninja-build,
  qt6-base-dev,
- phi-transport-api-dev (>= 2.0.0)
+ phi-transport-api-dev (>= 1.1.0)
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 Homepage: https://phisys.com
