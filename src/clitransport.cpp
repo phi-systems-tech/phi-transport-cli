@@ -46,8 +46,13 @@ QString CliTransport::description() const
     return QStringLiteral("Unix socket transport plugin for local CLI access.");
 }
 
-bool CliTransport::start(const QJsonObject &config, QString *errorString)
+bool CliTransport::start(std::string_view configJson, QString *errorString)
 {
+    // Config arrives as JSON text; parsed once here and used as before.
+    const QJsonObject config =
+        QJsonDocument::fromJson(QByteArray::fromRawData(configJson.data(),
+                                                       static_cast<qsizetype>(configJson.size())))
+            .object();
     if (m_running)
         stop();
 
@@ -97,7 +102,7 @@ void CliTransport::stop()
     m_running = false;
 }
 
-void CliTransport::onCoreAsyncResult(CmdId cmdId, const QJsonObject &payload)
+void CliTransport::onCoreAsyncResult(CmdId cmdId, std::string_view payloadJson)
 {
     auto it = m_pendingCommands.find(cmdId);
     if (it == m_pendingCommands.end()) {
@@ -119,14 +124,15 @@ void CliTransport::onCoreAsyncResult(CmdId cmdId, const QJsonObject &payload)
     if (!socket || socket->state() != QLocalSocket::ConnectedState)
         return;
 
-    sendCmdResponse(socket, pending.cid, pending.cmdTopic, payload);
+    sendCmdResponse(socket, pending.cid, pending.cmdTopic, payloadJson);
 }
 
-void CliTransport::onCoreEvent(const QString &topic, const QJsonObject &payload)
+void CliTransport::onCoreEvent(std::string_view topic, std::string_view payloadJson)
 {
-    if (topic.trimmed().isEmpty())
+    const QString topicText = QString::fromUtf8(topic.data(), static_cast<qsizetype>(topic.size()));
+    if (topicText.trimmed().isEmpty())
         return;
-    broadcastEvent(topic, payload);
+    broadcastEvent(topicText, payloadJson);
 }
 
 void CliTransport::onNewConnection()
@@ -286,22 +292,38 @@ void CliTransport::closeAllClients()
     }
 }
 
+// The transport's own small payloads (acks, protocol errors) are still built as
+// objects and serialized once right before assembly.
+static JsonText jsonTextOf(const QJsonObject &object)
+{
+    if (object.isEmpty())
+        return emptyJsonObject();
+    const QByteArray bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
+    return JsonText(bytes.constData(), static_cast<std::size_t>(bytes.size()));
+}
+
 void CliTransport::sendEnvelope(QLocalSocket *socket,
                                 const QString &type,
                                 const QString &topic,
-                                quint64 cid,
-                                const QJsonObject &payload) const
+                                std::optional<quint64> cid,
+                                std::string_view payloadJson) const
 {
     if (!socket || socket->state() != QLocalSocket::ConnectedState)
         return;
 
-    QJsonObject env;
-    env.insert(QStringLiteral("type"), type);
-    env.insert(QStringLiteral("topic"), topic);
-    env.insert(QStringLiteral("cid"), static_cast<qint64>(cid));
-    env.insert(QStringLiteral("payload"), payload);
-    const QByteArray data = QJsonDocument(env).toJson(QJsonDocument::Compact) + '\n';
-    socket->write(data);
+    // Assembled as text: nesting the payload needs neither a parse nor escaping.
+    JsonText out("{");
+    out += jsonField("type", jsonQuoted(type.toUtf8().toStdString()));
+    out += ',';
+    out += jsonField("topic", jsonQuoted(topic.toUtf8().toStdString()));
+    if (cid.has_value()) {
+        out += ',';
+        out += jsonField("cid", std::to_string(*cid));
+    }
+    out += ',';
+    out += jsonField("payload", payloadJson);
+    out += "}\n";
+    socket->write(out.data(), static_cast<qint64>(out.size()));
     socket->flush();
 }
 
@@ -331,10 +353,10 @@ void CliTransport::sendProtocolError(QLocalSocket *socket,
 void CliTransport::sendSyncResponse(QLocalSocket *socket,
                                     quint64 cid,
                                     const QString &syncTopic,
-                                    const QJsonObject &payload) const
+                                    std::string_view payloadJson) const
 {
-    QJsonObject out = payload;
-    out.insert(QStringLiteral("sync"), syncTopic);
+    const JsonText out =
+        withJsonField(payloadJson, "sync", jsonQuoted(syncTopic.toUtf8().toStdString()));
     sendEnvelope(socket, QString::fromLatin1(kTypeResponse), QString::fromLatin1(kTopicSyncResponse), cid, out);
 }
 
@@ -344,53 +366,59 @@ void CliTransport::sendAck(QLocalSocket *socket,
                            const QString &cmdTopic,
                            const QString &errorMsg) const
 {
-    const QJsonObject payload = makeAckPayload(accepted, cmdTopic, errorMsg);
-    sendEnvelope(socket, QString::fromLatin1(kTypeResponse), QString::fromLatin1(kTopicCmdAck), cid, payload);
+    sendEnvelope(socket,
+                 QString::fromLatin1(kTypeResponse),
+                 QString::fromLatin1(kTopicCmdAck),
+                 cid,
+                 jsonTextOf(makeAckPayload(accepted, cmdTopic, errorMsg)));
 }
 
 void CliTransport::sendCmdResponse(QLocalSocket *socket,
                                    quint64 cid,
                                    const QString &cmdTopic,
-                                   const QJsonObject &payload) const
+                                   std::string_view payloadJson) const
 {
-    QJsonObject out = payload;
+    // The one outbound path that parses: `error: null` is added only if absent, and
+    // deciding that from raw text would be a substring guess. Command responses are
+    // user-driven, so the parse sits on the cheap side of the trade.
+    QJsonObject out =
+        QJsonDocument::fromJson(QByteArray::fromRawData(payloadJson.data(),
+                                                       static_cast<qsizetype>(payloadJson.size())))
+            .object();
     out.insert(QStringLiteral("cmd"), cmdTopic);
     if (!out.contains(QStringLiteral("error")))
         out.insert(QStringLiteral("error"), QJsonValue::Null);
-    sendEnvelope(socket, QString::fromLatin1(kTypeResponse), QString::fromLatin1(kTopicCmdResponse), cid, out);
+    sendEnvelope(socket,
+                 QString::fromLatin1(kTypeResponse),
+                 QString::fromLatin1(kTopicCmdResponse),
+                 cid,
+                 jsonTextOf(out));
 }
 
 void CliTransport::sendEvent(QLocalSocket *socket,
                              const QString &topic,
-                             const QJsonObject &payload) const
+                             std::string_view payloadJson) const
 {
-    if (!socket || socket->state() != QLocalSocket::ConnectedState)
-        return;
-
-    QJsonObject env;
-    env.insert(QStringLiteral("type"), QString::fromLatin1(kTypeEvent));
-    env.insert(QStringLiteral("topic"), topic);
-    env.insert(QStringLiteral("payload"), payload);
-    const QByteArray data = QJsonDocument(env).toJson(QJsonDocument::Compact) + '\n';
-    socket->write(data);
-    socket->flush();
+    // No cid on events; otherwise the same concatenated envelope.
+    sendEnvelope(socket, QString::fromLatin1(kTypeEvent), topic, std::nullopt, payloadJson);
 }
 
-void CliTransport::broadcastEvent(const QString &topic, const QJsonObject &payload) const
+void CliTransport::broadcastEvent(const QString &topic, std::string_view payloadJson) const
 {
     for (QLocalSocket *client : m_clients)
-        sendEvent(client, topic, payload);
+        sendEvent(client, topic, payloadJson);
 }
 
 void CliTransport::handleCommand(QLocalSocket *socket,
                                  quint64 cid,
                                  const QString &topic,
-                                 const QJsonObject &payload)
+                                 std::string_view payloadJson)
 {
+    const std::string topicText = topic.toUtf8().toStdString();
     if (topic.startsWith(QStringLiteral("sync."))) {
-        const SyncResult result = callCoreSync(topic, payload);
+        const SyncResult result = callCoreSync(topicText, payloadJson);
         if (result.accepted) {
-            sendSyncResponse(socket, cid, topic, result.payload);
+            sendSyncResponse(socket, cid, topic, result.payloadJson);
         } else {
             const QString err = result.error.has_value() ? result.error->message : QStringLiteral("Sync call rejected");
             QJsonObject out;
@@ -400,7 +428,7 @@ void CliTransport::handleCommand(QLocalSocket *socket,
             if (result.error.has_value() && !result.error->ctx.isEmpty())
                 errObj.insert(QStringLiteral("ctx"), result.error->ctx);
             out.insert(QStringLiteral("error"), errObj);
-            sendSyncResponse(socket, cid, topic, out);
+            sendSyncResponse(socket, cid, topic, jsonTextOf(out));
         }
         return;
     }
@@ -411,7 +439,7 @@ void CliTransport::handleCommand(QLocalSocket *socket,
         return;
     }
 
-    const AsyncResult asyncSubmit = callCoreAsync(topic, payload);
+    const AsyncResult asyncSubmit = callCoreAsync(topicText, payloadJson);
     if (asyncSubmit.accepted && asyncSubmit.cmdId > 0) {
         PendingCommand pending;
         pending.socket = socket;
@@ -434,10 +462,10 @@ void CliTransport::handleCommand(QLocalSocket *socket,
         return;
     }
 
-    const SyncResult syncResult = callCoreSync(topic, payload);
+    const SyncResult syncResult = callCoreSync(topicText, payloadJson);
     if (syncResult.accepted) {
         sendAck(socket, cid, true, topic);
-        sendCmdResponse(socket, cid, topic, syncResult.payload);
+        sendCmdResponse(socket, cid, topic, syncResult.payloadJson);
         return;
     }
 
@@ -495,7 +523,11 @@ void CliTransport::processLine(QLocalSocket *socket, const QByteArray &line)
         return;
     }
 
-    handleCommand(socket, cid, topic, payload);
+    // The API takes the payload as text; the frame was parsed to read the envelope, so
+    // the sub-object is serialized once here. That is the cost side of the text
+    // boundary, and it sits on the command path rather than the event path.
+    const JsonText payloadJson = jsonTextOf(payload);
+    handleCommand(socket, cid, topic, payloadJson);
 }
 
 } // namespace phicore::transport::cli

@@ -5,6 +5,7 @@
 #include <QSet>
 
 #include <optional>
+#include <string_view>
 
 #include <transportinterface.h>
 
@@ -26,12 +27,12 @@ public:
     QString displayName() const override;
     QString description() const override;
 
-    bool start(const QJsonObject &config, QString *errorString) override;
+    bool start(std::string_view configJson, QString *errorString) override;
     void stop() override;
 
 protected:
-    void onCoreAsyncResult(CmdId cmdId, const QJsonObject &payload) override;
-    void onCoreEvent(const QString &topic, const QJsonObject &payload) override;
+    void onCoreAsyncResult(CmdId cmdId, std::string_view payloadJson) override;
+    void onCoreEvent(std::string_view topic, std::string_view payloadJson) override;
 
 private slots:
     void onNewConnection();
@@ -59,11 +60,13 @@ private:
 
     bool startServer(const QString &socketPath, QString *errorString);
     void closeAllClients();
+    // Outbound helpers take JSON text; nesting the payload under a key is
+    // concatenation, so an event forwarded from core is never re-parsed.
     void sendEnvelope(QLocalSocket *socket,
                       const QString &type,
                       const QString &topic,
-                      quint64 cid,
-                      const QJsonObject &payload) const;
+                      std::optional<quint64> cid,
+                      std::string_view payloadJson) const;
     void sendProtocolError(QLocalSocket *socket,
                            std::optional<quint64> cid,
                            const QString &code,
@@ -71,7 +74,7 @@ private:
     void sendSyncResponse(QLocalSocket *socket,
                           quint64 cid,
                           const QString &syncTopic,
-                          const QJsonObject &payload) const;
+                          std::string_view payloadJson) const;
     void sendAck(QLocalSocket *socket,
                  quint64 cid,
                  bool accepted,
@@ -80,15 +83,15 @@ private:
     void sendCmdResponse(QLocalSocket *socket,
                          quint64 cid,
                          const QString &cmdTopic,
-                         const QJsonObject &payload) const;
+                         std::string_view payloadJson) const;
     void sendEvent(QLocalSocket *socket,
                    const QString &topic,
-                   const QJsonObject &payload) const;
-    void broadcastEvent(const QString &topic, const QJsonObject &payload) const;
+                   std::string_view payloadJson) const;
+    void broadcastEvent(const QString &topic, std::string_view payloadJson) const;
     void handleCommand(QLocalSocket *socket,
                        quint64 cid,
                        const QString &topic,
-                       const QJsonObject &payload);
+                       std::string_view payloadJson);
     void processLine(QLocalSocket *socket, const QByteArray &line);
 
     bool m_running = false;
