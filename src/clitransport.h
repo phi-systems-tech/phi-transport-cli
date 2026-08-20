@@ -1,10 +1,14 @@
 #pragma once
 
+#include <QJsonObject>
+#include <QJsonValue>
 #include <QHash>
+#include <QObject>
 #include <QPointer>
 #include <QSet>
 
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include <transportinterface.h>
@@ -14,20 +18,21 @@ class QLocalSocket;
 
 namespace phicore::transport::cli {
 
-class CliTransport final : public TransportPluginBase
+// QObject first, as Qt requires for multiple inheritance. The transport
+// contract itself is Qt-free; this plugin uses Qt for its own I/O, which is its
+// business rather than the contract's.
+class CliTransport final : public QObject, public TransportPluginBase
 {
     Q_OBJECT
-    Q_PLUGIN_METADATA(IID PHI_TRANSPORT_INTERFACE_IID)
-    Q_INTERFACES(phicore::transport::TransportInterface)
 
 public:
     explicit CliTransport(QObject *parent = nullptr);
 
-    QString pluginType() const override;
-    QString displayName() const override;
-    QString description() const override;
+    std::string pluginType() const override;
+    std::string displayName() const override;
+    std::string description() const override;
 
-    bool start(std::string_view configJson, QString *errorString) override;
+    bool start(std::string_view configJson, std::string *errorString) override;
     void stop() override;
 
 protected:

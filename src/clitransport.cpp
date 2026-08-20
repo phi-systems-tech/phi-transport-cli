@@ -1,5 +1,8 @@
 #include "clitransport.h"
 
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QJsonValue>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -27,27 +30,34 @@ constexpr const char kDefaultSocketPath[] = "/var/lib/phi/@1/cli.sock";
 } // namespace
 
 CliTransport::CliTransport(QObject *parent)
-    : TransportPluginBase(parent)
+    : QObject(parent)
 {
 }
 
-QString CliTransport::pluginType() const
+std::string CliTransport::pluginType() const
 {
-    return QStringLiteral("cli");
+    return "cli";
 }
 
-QString CliTransport::displayName() const
+std::string CliTransport::displayName() const
 {
-    return QStringLiteral("CLI");
+    return "CLI";
 }
 
-QString CliTransport::description() const
+std::string CliTransport::description() const
 {
-    return QStringLiteral("Unix socket transport plugin for local CLI access.");
+    return "Unix socket transport plugin for local CLI access.";
 }
 
-bool CliTransport::start(std::string_view configJson, QString *errorString)
+bool CliTransport::start(std::string_view configJson, std::string *errorString)
 {
+    // The private helpers below stay in QString; only the contract is Qt-free.
+    QString localError;
+    const auto reportError = [&]() {
+        if (errorString)
+            *errorString = localError.toStdString();
+        return false;
+    };
     // Config arrives as JSON text; parsed once here and used as before.
     const QJsonObject config =
         QJsonDocument::fromJson(QByteArray::fromRawData(configJson.data(),
@@ -58,13 +68,12 @@ bool CliTransport::start(std::string_view configJson, QString *errorString)
 
     const QString socketPath = socketPathFromConfig(config);
     if (socketPath.trimmed().isEmpty()) {
-        if (errorString)
-            *errorString = QStringLiteral("Invalid socketPath");
-        return false;
+        localError = QStringLiteral("Invalid socketPath");
+        return reportError();
     }
 
-    if (!startServer(socketPath, errorString))
-        return false;
+    if (!startServer(socketPath, &localError))
+        return reportError();
 
     m_socketPath = socketPath;
     m_running = true;
@@ -531,3 +540,5 @@ void CliTransport::processLine(QLocalSocket *socket, const QByteArray &line)
 }
 
 } // namespace phicore::transport::cli
+
+PHI_TRANSPORT_PLUGIN(phicore::transport::cli::CliTransport)

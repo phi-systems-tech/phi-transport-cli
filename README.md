@@ -53,7 +53,7 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 
 ### Runtime Model
 
-- Runs as `TransportInterface` Qt plugin.
+- Runs as a `TransportInterface` shared-object plugin (Qt-free contract; the plugin uses Qt internally).
 - Exactly one plugin instance per transport plugin type.
 
 ### Core Integration Contract
@@ -156,7 +156,7 @@ Selector rules (aligned to `phi-transport-api/PROTOCOLL.md`):
 
 ### Troubleshooting
 
-- If plugin loading fails, verify IID compatibility with `phi-transport-api`.
+- If plugin loading fails, check the log line: it names the API version core expects. Rebuild against that `phi-transport-api`.
 
 ### Maintainers
 
