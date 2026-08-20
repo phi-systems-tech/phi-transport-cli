@@ -54,6 +54,9 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 ### Runtime Model
 
 - Runs as a `TransportInterface` shared-object plugin (Qt-free contract; the plugin uses Qt internally).
+- Runs on the core-owned transport thread and uses its event loop (PROTOCOLL.md 6.6): the
+  `QLocalServer` and every client socket live there. This plugin starts no thread and no
+  event loop of its own.
 - Exactly one plugin instance per transport plugin type.
 
 ### Core Integration Contract
