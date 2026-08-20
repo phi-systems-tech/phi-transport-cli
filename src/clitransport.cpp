@@ -68,14 +68,13 @@ bool CliTransport::start(std::string_view configJson, QString *errorString)
 
     m_socketPath = socketPath;
     m_running = true;
-    QJsonObject fields;
-    fields.insert(QStringLiteral("socketPath"), m_socketPath);
+    const std::string socketPathText = m_socketPath.toStdString();
     writeLog(LogLevel::Info,
              makeCategory(LogCategory::Transport),
-             QByteArrayLiteral("CLI transport started on unix socket %1"),
-             QVariantList{m_socketPath},
-             QByteArrayLiteral("cli.start"),
-             fields);
+             "CLI transport started on unix socket %1",
+             {Scalar{socketPathText}},
+             "cli.start",
+             jsonObject({{"socketPath", jsonQuoted(socketPathText)}}));
     return true;
 }
 
@@ -106,14 +105,13 @@ void CliTransport::onCoreAsyncResult(CmdId cmdId, std::string_view payloadJson)
 {
     auto it = m_pendingCommands.find(cmdId);
     if (it == m_pendingCommands.end()) {
-        QJsonObject fields;
-        fields.insert(QStringLiteral("cmdId"), static_cast<qint64>(cmdId));
+        const std::string cmdIdText = std::to_string(cmdId);
         writeLog(LogLevel::Warn,
                  makeCategory(LogCategory::Transport),
-                 QByteArrayLiteral("No pending CLI command for cmdId=%1"),
-                 QVariantList{static_cast<qulonglong>(cmdId)},
-                 QByteArrayLiteral("cli.asyncResultMissing"),
-                 fields);
+                 "No pending CLI command for cmdId=%1",
+                 {Scalar{static_cast<std::int64_t>(cmdId)}},
+                 "cli.asyncResultMissing",
+                 jsonObject({{"cmdId", cmdIdText}}));
         return;
     }
 
@@ -420,15 +418,17 @@ void CliTransport::handleCommand(QLocalSocket *socket,
         if (result.accepted) {
             sendSyncResponse(socket, cid, topic, result.payloadJson);
         } else {
-            const QString err = result.error.has_value() ? result.error->message : QStringLiteral("Sync call rejected");
-            QJsonObject out;
-            out.insert(QStringLiteral("accepted"), false);
-            QJsonObject errObj;
-            errObj.insert(QStringLiteral("message"), err);
-            if (result.error.has_value() && !result.error->ctx.isEmpty())
-                errObj.insert(QStringLiteral("ctx"), result.error->ctx);
-            out.insert(QStringLiteral("error"), errObj);
-            sendSyncResponse(socket, cid, topic, jsonTextOf(out));
+            // Assembled as text: the error type is Qt-free, so this rejection
+            // payload needs no JSON document either.
+            const std::string err = result.error.has_value()
+                ? result.error->message
+                : std::string("Sync call rejected");
+            const JsonText errObj = (result.error.has_value() && !result.error->ctx.empty())
+                ? jsonObject({{"message", jsonQuoted(err)},
+                              {"ctx", jsonQuoted(result.error->ctx)}})
+                : jsonObject({{"message", jsonQuoted(err)}});
+            sendSyncResponse(socket, cid, topic,
+                             jsonObject({{"accepted", "false"}, {"error", errObj}}));
         }
         return;
     }
@@ -452,11 +452,11 @@ void CliTransport::handleCommand(QLocalSocket *socket,
 
     const bool asyncUnsupportedTopic =
         asyncSubmit.error.has_value()
-        && asyncSubmit.error->message == QStringLiteral("Unsupported async topic");
+        && asyncSubmit.error->message == "Unsupported async topic";
     if (!asyncUnsupportedTopic) {
         const QString asyncErr =
-            asyncSubmit.error.has_value() && !asyncSubmit.error->message.isEmpty()
-                ? asyncSubmit.error->message
+            asyncSubmit.error.has_value() && !asyncSubmit.error->message.empty()
+                ? QString::fromStdString(asyncSubmit.error->message)
                 : QStringLiteral("Command rejected");
         sendAck(socket, cid, false, topic, asyncErr);
         return;
@@ -480,10 +480,10 @@ void CliTransport::handleCommand(QLocalSocket *socket,
     }
 
     const QString errorMsg =
-        syncResult.error.has_value() && !syncResult.error->message.isEmpty()
-            ? syncResult.error->message
-            : (asyncSubmit.error.has_value() && !asyncSubmit.error->message.isEmpty()
-                   ? asyncSubmit.error->message
+        syncResult.error.has_value() && !syncResult.error->message.empty()
+            ? QString::fromStdString(syncResult.error->message)
+            : (asyncSubmit.error.has_value() && !asyncSubmit.error->message.empty()
+                   ? QString::fromStdString(asyncSubmit.error->message)
                    : QStringLiteral("Command rejected"));
     sendAck(socket, cid, false, topic, errorMsg);
 }
