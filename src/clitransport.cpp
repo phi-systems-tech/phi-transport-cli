@@ -15,16 +15,9 @@ namespace phicore::transport::cli {
 
 namespace {
 
-constexpr const char kTypeEvent[] = "event";
-constexpr const char kTypeCmd[] = "cmd";
-constexpr const char kTypeResponse[] = "response";
-constexpr const char kTypeError[] = "error";
-
-constexpr const char kTopicCmdAck[] = "cmd.ack";
-constexpr const char kTopicCmdResponse[] = "cmd.response";
-constexpr const char kTopicSyncResponse[] = "sync.response";
-constexpr const char kTopicProtocolError[] = "protocol.error";
-
+// Envelope types and the topics a transport produces itself come from
+// envelope.h: they are protocol surface, and a copy per transport is how two
+// wires drift apart.
 constexpr const char kDefaultSocketPath[] = "/var/lib/phi/@1/cli.sock";
 
 } // namespace
@@ -139,7 +132,7 @@ void CliTransport::onCoreEvent(std::string_view topic, std::string_view payloadJ
     const QString topicText = QString::fromUtf8(topic.data(), static_cast<qsizetype>(topic.size()));
     if (topicText.trimmed().isEmpty())
         return;
-    broadcastEvent(topicText, payloadJson);
+    broadcastEvent(topic, payloadJson);
 }
 
 void CliTransport::onNewConnection()
@@ -211,48 +204,13 @@ QString CliTransport::socketPathFromConfig(const QJsonObject &config)
     return QString::fromLatin1(kDefaultSocketPath);
 }
 
-bool CliTransport::tryReadCid(const QJsonValue &value, quint64 *cidOut)
+std::optional<CmdId> CliTransport::readCid(const QJsonValue &value)
 {
-    if (!cidOut)
-        return false;
-
-    if (value.isDouble()) {
-        const double raw = value.toDouble(-1.0);
-        if (raw < 0.0)
-            return false;
-        *cidOut = static_cast<quint64>(raw);
-        return true;
-    }
-
-    if (value.isString()) {
-        bool ok = false;
-        const quint64 parsed = value.toString().toULongLong(&ok);
-        if (!ok)
-            return false;
-        *cidOut = parsed;
-        return true;
-    }
-
-    return false;
-}
-
-QJsonObject CliTransport::makeAckPayload(bool accepted,
-                                         const QString &cmdTopic,
-                                         const QString &errorMsg,
-                                         const QString &errorCode)
-{
-    QJsonObject payload;
-    payload.insert(QStringLiteral("accepted"), accepted);
-    payload.insert(QStringLiteral("cmd"), cmdTopic);
-    if (errorMsg.isEmpty()) {
-        payload.insert(QStringLiteral("error"), QJsonValue::Null);
-    } else {
-        QJsonObject err;
-        err.insert(QStringLiteral("code"), errorCode);
-        err.insert(QStringLiteral("message"), errorMsg);
-        payload.insert(QStringLiteral("error"), err);
-    }
-    return payload;
+    if (value.isDouble())
+        return cidFromNumber(value.toDouble(-1.0));
+    if (value.isString())
+        return cidFromString(value.toString().toStdString());
+    return std::nullopt;
 }
 
 bool CliTransport::startServer(const QString &socketPath, QString *errorString)
@@ -299,8 +257,8 @@ void CliTransport::closeAllClients()
     }
 }
 
-// The transport's own small payloads (acks, protocol errors) are still built as
-// objects and serialized once right before assembly.
+// One Qt-side utility remains: turning a QJsonObject this transport built or
+// parsed into the text the boundary speaks.
 static JsonText jsonTextOf(const QJsonObject &object)
 {
     if (object.isEmpty())
@@ -309,79 +267,33 @@ static JsonText jsonTextOf(const QJsonObject &object)
     return JsonText(bytes.constData(), static_cast<std::size_t>(bytes.size()));
 }
 
-void CliTransport::sendEnvelope(QLocalSocket *socket,
-                                const QString &type,
-                                const QString &topic,
-                                std::optional<quint64> cid,
-                                std::string_view payloadJson) const
+void CliTransport::send(QLocalSocket *socket,
+                        std::string_view type,
+                        std::string_view topic,
+                        std::optional<CmdId> cid,
+                        std::string_view payloadJson) const
 {
     if (!socket || socket->state() != QLocalSocket::ConnectedState)
         return;
 
-    // Assembled as text: nesting the payload needs neither a parse nor escaping.
-    JsonText out("{");
-    out += jsonField("type", jsonQuoted(type.toUtf8().toStdString()));
-    out += ',';
-    out += jsonField("topic", jsonQuoted(topic.toUtf8().toStdString()));
-    if (cid.has_value()) {
-        out += ',';
-        out += jsonField("cid", std::to_string(*cid));
-    }
-    out += ',';
-    out += jsonField("payload", payloadJson);
-    out += "}\n";
+    // The envelope shape comes from the shared header; the trailing newline is
+    // this wire's framing and the only part that differs from the WS transport.
+    JsonText out = makeEnvelope(type, topic, cid, payloadJson);
+    out += '\n';
     socket->write(out.data(), static_cast<qint64>(out.size()));
     socket->flush();
 }
 
 void CliTransport::sendProtocolError(QLocalSocket *socket,
-                                     std::optional<quint64> cid,
-                                     const QString &code,
-                                     const QString &message) const
+                                     std::optional<CmdId> cid,
+                                     std::string_view code,
+                                     std::string_view message) const
 {
-    if (!socket || socket->state() != QLocalSocket::ConnectedState)
-        return;
-
-    QJsonObject payload;
-    payload.insert(QStringLiteral("code"), code);
-    payload.insert(QStringLiteral("message"), message);
-
-    QJsonObject env;
-    env.insert(QStringLiteral("type"), QString::fromLatin1(kTypeError));
-    env.insert(QStringLiteral("topic"), QString::fromLatin1(kTopicProtocolError));
-    if (cid.has_value())
-        env.insert(QStringLiteral("cid"), static_cast<qint64>(*cid));
-    env.insert(QStringLiteral("payload"), payload);
-    const QByteArray data = QJsonDocument(env).toJson(QJsonDocument::Compact) + '\n';
-    socket->write(data);
-    socket->flush();
-}
-
-void CliTransport::sendSyncResponse(QLocalSocket *socket,
-                                    quint64 cid,
-                                    const QString &syncTopic,
-                                    std::string_view payloadJson) const
-{
-    const JsonText out =
-        withJsonField(payloadJson, "sync", jsonQuoted(syncTopic.toUtf8().toStdString()));
-    sendEnvelope(socket, QString::fromLatin1(kTypeResponse), QString::fromLatin1(kTopicSyncResponse), cid, out);
-}
-
-void CliTransport::sendAck(QLocalSocket *socket,
-                           quint64 cid,
-                           bool accepted,
-                           const QString &cmdTopic,
-                           const QString &errorMsg) const
-{
-    sendEnvelope(socket,
-                 QString::fromLatin1(kTypeResponse),
-                 QString::fromLatin1(kTopicCmdAck),
-                 cid,
-                 jsonTextOf(makeAckPayload(accepted, cmdTopic, errorMsg)));
+    send(socket, kEnvelopeTypeError, kTopicProtocolError, cid, makeProtocolErrorPayload(code, message));
 }
 
 void CliTransport::sendCmdResponse(QLocalSocket *socket,
-                                   quint64 cid,
+                                   CmdId cid,
                                    const QString &cmdTopic,
                                    std::string_view payloadJson) const
 {
@@ -395,106 +307,39 @@ void CliTransport::sendCmdResponse(QLocalSocket *socket,
     out.insert(QStringLiteral("cmd"), cmdTopic);
     if (!out.contains(QStringLiteral("error")))
         out.insert(QStringLiteral("error"), QJsonValue::Null);
-    sendEnvelope(socket,
-                 QString::fromLatin1(kTypeResponse),
-                 QString::fromLatin1(kTopicCmdResponse),
-                 cid,
-                 jsonTextOf(out));
+    send(socket, kEnvelopeTypeResponse, kTopicCmdResponse, cid, jsonTextOf(out));
 }
 
-void CliTransport::sendEvent(QLocalSocket *socket,
-                             const QString &topic,
-                             std::string_view payloadJson) const
+void CliTransport::broadcastEvent(std::string_view topic, std::string_view payloadJson) const
 {
-    // No cid on events; otherwise the same concatenated envelope.
-    sendEnvelope(socket, QString::fromLatin1(kTypeEvent), topic, std::nullopt, payloadJson);
-}
-
-void CliTransport::broadcastEvent(const QString &topic, std::string_view payloadJson) const
-{
+    // No cid on events; otherwise the same envelope as everything else.
     for (QLocalSocket *client : m_clients)
-        sendEvent(client, topic, payloadJson);
+        send(client, kEnvelopeTypeEvent, topic, std::nullopt, payloadJson);
 }
 
 void CliTransport::handleCommand(QLocalSocket *socket,
-                                 quint64 cid,
+                                 CmdId cid,
                                  const QString &topic,
                                  std::string_view payloadJson)
 {
-    const std::string topicText = topic.toUtf8().toStdString();
-    if (topic.startsWith(QStringLiteral("sync."))) {
-        const SyncResult result = callCoreSync(topicText, payloadJson);
-        if (result.accepted) {
-            sendSyncResponse(socket, cid, topic, result.payloadJson);
-        } else {
-            // Assembled as text: the error type is Qt-free, so this rejection
-            // payload needs no JSON document either.
-            const std::string err = result.error.has_value()
-                ? result.error->message
-                : std::string("Sync call rejected");
-            const JsonText errObj = (result.error.has_value() && !result.error->ctx.empty())
-                ? jsonObject({{"message", jsonQuoted(err)},
-                              {"ctx", jsonQuoted(result.error->ctx)}})
-                : jsonObject({{"message", jsonQuoted(err)}});
-            sendSyncResponse(socket, cid, topic,
-                             jsonObject({{"accepted", "false"}, {"error", errObj}}));
-        }
-        return;
-    }
+    // Routing is the protocol's decision, made once in TransportPluginBase - this
+    // transport used to carry its own sync fallback for `cmd.*` topics, which the
+    // WS transport never had. Same rule for both now, and no fallback: a command
+    // core will not take is a rejected command.
+    const CommandOutcome outcome = dispatchCommand(topic.toUtf8().toStdString(), payloadJson);
 
-    if (!topic.startsWith(QStringLiteral("cmd."))) {
-        sendProtocolError(socket, cid, QStringLiteral("unknown_topic"),
-                          QStringLiteral("Unknown command topic: %1").arg(topic));
-        return;
-    }
-
-    const AsyncResult asyncSubmit = callCoreAsync(topicText, payloadJson);
-    if (asyncSubmit.accepted && asyncSubmit.cmdId > 0) {
+    if (outcome.cmdId > 0) {
+        // Core took the command and answers later; the client waits under that id
+        // until onCoreAsyncResult arrives.
         PendingCommand pending;
         pending.socket = socket;
         pending.cid = cid;
         pending.cmdTopic = topic;
-        m_pendingCommands.insert(asyncSubmit.cmdId, pending);
-        sendAck(socket, cid, true, topic);
-        return;
+        m_pendingCommands.insert(outcome.cmdId, pending);
     }
 
-    const bool asyncUnsupportedTopic =
-        asyncSubmit.error.has_value()
-        && asyncSubmit.error->message == "Unsupported async topic";
-    if (!asyncUnsupportedTopic) {
-        const QString asyncErr =
-            asyncSubmit.error.has_value() && !asyncSubmit.error->message.empty()
-                ? QString::fromStdString(asyncSubmit.error->message)
-                : QStringLiteral("Command rejected");
-        sendAck(socket, cid, false, topic, asyncErr);
-        return;
-    }
-
-    const SyncResult syncResult = callCoreSync(topicText, payloadJson);
-    if (syncResult.accepted) {
-        sendAck(socket, cid, true, topic);
-        sendCmdResponse(socket, cid, topic, syncResult.payloadJson);
-        return;
-    }
-
-    const bool unknownTopic =
-        syncResult.error.has_value()
-        && syncResult.error->message == QStringLiteral("Unsupported sync topic");
-
-    if (unknownTopic) {
-        sendProtocolError(socket, cid, QStringLiteral("unknown_topic"),
-                          QStringLiteral("Unknown command topic: %1").arg(topic));
-        return;
-    }
-
-    const QString errorMsg =
-        syncResult.error.has_value() && !syncResult.error->message.empty()
-            ? QString::fromStdString(syncResult.error->message)
-            : (asyncSubmit.error.has_value() && !asyncSubmit.error->message.empty()
-                   ? QString::fromStdString(asyncSubmit.error->message)
-                   : QStringLiteral("Command rejected"));
-    sendAck(socket, cid, false, topic, errorMsg);
+    const auto [type, envelopeTopic] = envelopeFor(outcome.kind);
+    send(socket, type, envelopeTopic, cid, outcome.payloadJson);
 }
 
 void CliTransport::processLine(QLocalSocket *socket, const QByteArray &line)
@@ -502,33 +347,28 @@ void CliTransport::processLine(QLocalSocket *socket, const QByteArray &line)
     QJsonParseError parseError;
     const QJsonDocument doc = QJsonDocument::fromJson(line, &parseError);
     if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
-        sendProtocolError(socket, std::nullopt, QStringLiteral("invalid_json"),
-                          QStringLiteral("Payload must be a valid JSON object."));
+        sendProtocolError(socket, std::nullopt, kErrorCodeInvalidJson, kMessageInvalidJson);
         return;
     }
 
     const QJsonObject obj = doc.object();
     const QString type = obj.value(QStringLiteral("type")).toString();
     const QString topic = obj.value(QStringLiteral("topic")).toString();
-    const QJsonValue cidValue = obj.value(QStringLiteral("cid"));
     const QJsonObject payload = obj.value(QStringLiteral("payload")).toObject();
 
-    quint64 cid = 0;
-    if (!tryReadCid(cidValue, &cid)) {
-        sendProtocolError(socket, std::nullopt, QStringLiteral("missing_cid"),
-                          QStringLiteral("Commands must include numeric 'cid'."));
+    const std::optional<CmdId> cid = readCid(obj.value(QStringLiteral("cid")));
+    if (!cid.has_value()) {
+        sendProtocolError(socket, std::nullopt, kErrorCodeMissingCid, kMessageMissingCid);
         return;
     }
 
-    if (type != QLatin1String(kTypeCmd)) {
-        sendProtocolError(socket, cid, QStringLiteral("invalid_type"),
-                          QStringLiteral("Only messages with type='cmd' are supported."));
+    if (type.toStdString() != kEnvelopeTypeCmd) {
+        sendProtocolError(socket, cid, kErrorCodeInvalidType, kMessageInvalidType);
         return;
     }
 
     if (topic.trimmed().isEmpty()) {
-        sendProtocolError(socket, cid, QStringLiteral("missing_topic"),
-                          QStringLiteral("Missing command topic."));
+        sendProtocolError(socket, cid, kErrorCodeMissingTopic, kMessageMissingTopic);
         return;
     }
 
@@ -536,7 +376,7 @@ void CliTransport::processLine(QLocalSocket *socket, const QByteArray &line)
     // the sub-object is serialized once here. That is the cost side of the text
     // boundary, and it sits on the command path rather than the event path.
     const JsonText payloadJson = jsonTextOf(payload);
-    handleCommand(socket, cid, topic, payloadJson);
+    handleCommand(socket, *cid, topic, payloadJson);
 }
 
 } // namespace phicore::transport::cli

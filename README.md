@@ -59,6 +59,11 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 ### Core Integration Contract
 
 - All core calls go through `callCoreSync` / `callCoreAsync`.
+- Routing is not this transport's decision: `TransportPluginBase::dispatchCommand` in
+  `phi-transport-api` decides, and it decides the same way for every transport - `sync.*`
+  synchronously, `cmd.*` asynchronously, anything else an unknown topic. There is no sync
+  fallback for `cmd.*`; this transport carried one until it was removed as drift
+  (phi-core audit F-61), and the WS transport never had it.
 - Do not access core registries/managers directly.
 - Auth is validated in `phi-core`.
 
