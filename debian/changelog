@@ -1,3 +1,10 @@
+phi-transport-cli (0.0~git202608201704.23fe323-1) trixie; urgency=medium
+
+  * Rebuild against phi-transport-api 1.3.0: log fields and the sync-rejection
+    payload are assembled as JSON text instead of through QJsonObject.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Thu, 20 Aug 2026 17:04:26 +0200
+
 phi-transport-cli (0.0~git202608192352.d7ac1cd-1) trixie; urgency=medium
 
   * Assemble envelopes from UTF-8 JSON text: the transport API data path is text, so
