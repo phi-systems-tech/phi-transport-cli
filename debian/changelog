@@ -1,3 +1,11 @@
+phi-transport-cli (0.0~git202608211603.05a14b8-1) trixie; urgency=medium
+
+  * Envelope and routing come from phi-transport-api 1.6.0 instead of a local
+    copy, and the sync fallback for cmd.* topics is gone.
+  * Tells core who is calling: the unix socket's permissions are the credential,
+    so the caller identity is TrustedLocal.
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Fri, 21 Aug 2026 16:03:45 +0200
+
 phi-transport-cli (0.0~git202608201904.e61bd2d-1) trixie; urgency=medium
 
   * Rebuild against phi-transport-api 1.4.0: plain shared-object plugin with
