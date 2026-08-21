@@ -69,6 +69,10 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
   (phi-core audit F-61), and the WS transport never had it.
 - Do not access core registries/managers directly.
 - Auth is validated in `phi-core`.
+- This transport calls core with `CallerIdentity::TrustedLocal`: its socket is the credential.
+  `clitransport.cpp` sets the socket to owner+group read/write on a `phi`-owned path, so whoever
+  can connect is already privileged on the machine. That assertion is this transport's
+  responsibility - it must never be made by a channel reachable beyond the box.
 
 ### Protocol Contract
 

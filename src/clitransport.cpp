@@ -326,7 +326,13 @@ void CliTransport::handleCommand(QLocalSocket *socket,
     // transport used to carry its own sync fallback for `cmd.*` topics, which the
     // WS transport never had. Same rule for both now, and no fallback: a command
     // core will not take is a rejected command.
-    const CommandOutcome outcome = dispatchCommand(topic.toUtf8().toStdString(), payloadJson);
+    //
+    // The identity is TrustedLocal: this transport listens on a unix socket whose
+    // permissions are the credential, so whoever reached it is already privileged
+    // on the box. Core is told that rather than left to guess (F-60).
+    CallerIdentity caller;
+    caller.kind = CallerIdentity::Kind::TrustedLocal;
+    const CommandOutcome outcome = dispatchCommand(topic.toUtf8().toStdString(), payloadJson, caller);
 
     if (outcome.cmdId > 0) {
         // Core took the command and answers later; the client waits under that id
