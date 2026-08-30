@@ -44,6 +44,7 @@ void printUsage()
     out << "  phi-cli adapter start|stop|restart (--id <id> | --external-id <id> | --name <name>) [--tenant <tenant>] [--socket <path>]\n";
     out << "  phi-cli adapter start|stop|restart <plugin> --all [--tenant <tenant>] [--socket <path>]\n";
     out << "  phi-cli adapter reload <plugin> [--tenant <tenant>] [--socket <path>]\n";
+    out << "  phi-cli adapter rescan [--tenant <tenant>] [--socket <path>]\n";
     out << "  phi-cli adapter invoke <actionId> (--id <id> | --external-id <id> | --name <name>) [--params <json>] [--json] [--tenant <tenant>] [--socket <path>]\n";
     out << "  phi-cli transport start|stop|restart|reload <plugin> [--tenant <tenant>] [--socket <path>]\n";
 }
@@ -650,6 +651,7 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
         && opts.action != QStringLiteral("stop")
         && opts.action != QStringLiteral("restart")
         && opts.action != QStringLiteral("reload")
+        && opts.action != QStringLiteral("rescan")
         && opts.action != QStringLiteral("invoke")) {
         if (errorOut)
             *errorOut = QStringLiteral("Unknown action: %1").arg(opts.action);
@@ -739,6 +741,15 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
         if (opts.selectorType != AdapterSelectorType::None || opts.all) {
             if (errorOut)
                 *errorOut = QStringLiteral("adapter list does not support selectors or --all");
+            return false;
+        }
+    } else if (opts.action == QStringLiteral("rescan")) {
+        // Nothing to select. The whole point of it is that it takes no
+        // argument: dpkg has just put something in the plugin directory and
+        // core is being told to look, not told what to look for.
+        if (opts.selectorType != AdapterSelectorType::None || opts.all) {
+            if (errorOut)
+                *errorOut = QStringLiteral("adapter rescan does not support selectors or --all");
             return false;
         }
     } else if (opts.action == QStringLiteral("discover")) {
@@ -1005,6 +1016,20 @@ int main(int argc, char **argv)
         }
         QTextStream(stdout) << "Transport " << opts.action << " completed for pluginType '"
                             << opts.selectorValue << "'\n";
+        return 0;
+    }
+
+    if (opts.action == QStringLiteral("rescan")) {
+        QJsonObject response;
+        QString error;
+        if (!sendCommand(opts.socketPath, QStringLiteral("cmd.adapter.plugins.rescan"), {},
+                         &response, &error)) {
+            QTextStream(stderr) << error << "\n";
+            return 1;
+        }
+        const QJsonArray factories = response.value(QStringLiteral("factories")).toArray();
+        QTextStream(stdout) << "Plugin directories read again: " << factories.size()
+                            << " adapter types available\n";
         return 0;
     }
 
