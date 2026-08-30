@@ -1,3 +1,10 @@
+phi-transport-cli (0.0~git202608301404.e93ff68-1) trixie; urgency=medium
+
+  * adapter rescan, which phi-core's dpkg trigger calls when an adapter
+    package lands.
+
+ -- Marius Schumacher <google@phisys.com>  Sun, 30 Aug 2026 14:04:16 +0200
+
 phi-transport-cli (0.0~git202608211603.05a14b8-1) trixie; urgency=medium
 
   * Envelope and routing come from phi-transport-api 1.6.0 instead of a local
