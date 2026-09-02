@@ -1,32 +1,27 @@
 #pragma once
 
-#include <QJsonObject>
-#include <QJsonValue>
-#include <QHash>
-#include <QObject>
-#include <QPointer>
-#include <QSet>
+#include <transportinterface.h>
 
+#include <phi/runtime/loop.h>
+
+#include <cstdint>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 
-#include <transportinterface.h>
-
-class QLocalServer;
-class QLocalSocket;
-
 namespace phicore::transport::cli {
 
-// QObject first, as Qt requires for multiple inheritance. The transport
-// contract itself is Qt-free; this plugin uses Qt for its own I/O, which is its
-// business rather than the contract's.
-class CliTransport final : public QObject, public TransportPluginBase
+// The CLI transport on the runtime loop (contract 2.0.0): a unix-socket
+// server whose listen and client descriptors are watches on the loop core
+// hands the plugin. No Qt and no thread of its own - the loop's thread is
+// where everything here runs, including the contract callbacks.
+class CliTransport final : public TransportPluginBase
 {
-    Q_OBJECT
-
 public:
-    explicit CliTransport(QObject *parent = nullptr);
+    CliTransport() = default;
+    ~CliTransport() override;
 
     std::string pluginType() const override;
     std::string displayName() const override;
@@ -39,59 +34,53 @@ protected:
     void onCoreAsyncResult(CmdId cmdId, std::string_view payloadJson) override;
     void onCoreEvent(std::string_view topic, std::string_view payloadJson) override;
 
-private slots:
-    void onNewConnection();
-    void onSocketDisconnected();
-    void onSocketReadyRead();
-
 private:
-    struct ClientBuffer {
-        QPointer<QLocalSocket> socket;
-        QByteArray buffer;
+    // One connected client. Destroyed only through a deferred post: a watch
+    // must never be reset from inside its own firing callback, so teardown
+    // happens on the next loop turn while a `closed` flag quiets this one.
+    struct Client {
+        int fd = -1;
+        bool closed = false;
+        phi::runtime::FdWatch readWatch;
+        phi::runtime::FdWatch writeWatch; // enabled only while outBuffer holds bytes
+        std::string inBuffer;
+        std::string outBuffer;
     };
 
     struct PendingCommand {
-        QPointer<QLocalSocket> socket;
-        quint64 cid = 0;
-        QString cmdTopic;
+        int clientFd = -1;
+        CmdId cid = 0;
+        std::string cmdTopic;
     };
 
-    static QString socketPathFromConfig(const QJsonObject &config);
-    // Which JSON shapes a cid may arrive in; what counts as a valid one is the
-    // protocol's answer and lives in the shared header.
-    static std::optional<CmdId> readCid(const QJsonValue &value);
+    void acceptClients();
+    void onClientReadable(Client *client);
+    void onClientWritable(Client *client);
+    void processLine(Client *client, std::string_view line);
+    void handleCommand(Client *client, CmdId cid, const std::string &topic, std::string_view payloadJson);
 
-    bool startServer(const QString &socketPath, QString *errorString);
-    void closeAllClients();
-    // The one outbound primitive. Envelope and payload shapes come from
-    // envelope.h; the newline that frames them on this wire is this transport's
-    // own business.
-    void send(QLocalSocket *socket,
+    void send(Client *client,
               std::string_view type,
               std::string_view topic,
               std::optional<CmdId> cid,
-              std::string_view payloadJson) const;
-    void sendProtocolError(QLocalSocket *socket,
-                           std::optional<CmdId> cid,
-                           std::string_view code,
-                           std::string_view message) const;
-    void sendCmdResponse(QLocalSocket *socket,
-                         CmdId cid,
-                         const QString &cmdTopic,
-                         std::string_view payloadJson) const;
-    void broadcastEvent(std::string_view topic, std::string_view payloadJson) const;
-    void handleCommand(QLocalSocket *socket,
-                       CmdId cid,
-                       const QString &topic,
-                       std::string_view payloadJson);
-    void processLine(QLocalSocket *socket, const QByteArray &line);
+              std::string_view payloadJson);
+    void sendProtocolError(Client *client, std::optional<CmdId> cid,
+                           std::string_view code, std::string_view message);
+    void sendCmdResponse(Client *client, CmdId cid,
+                         const std::string &cmdTopic, std::string_view payloadJson);
+    void broadcastEvent(std::string_view topic, std::string_view payloadJson);
 
+    void flushClient(Client *client);
+    void dropClient(int fd);
+    void closeListener();
+
+    int m_listenFd = -1;
+    phi::runtime::FdWatch m_listenWatch;
+    std::string m_socketPath;
     bool m_running = false;
-    QString m_socketPath;
-    QLocalServer *m_server = nullptr;
-    QSet<QLocalSocket *> m_clients;
-    QHash<QLocalSocket *, ClientBuffer> m_clientBuffers;
-    QHash<CmdId, PendingCommand> m_pendingCommands;
+
+    std::map<int, std::shared_ptr<Client>> m_clients;   // key: fd
+    std::map<CmdId, PendingCommand> m_pendingCommands;  // key: core cmdId
 };
 
 } // namespace phicore::transport::cli

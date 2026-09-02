@@ -12,8 +12,11 @@ set(CMAKE_AUTOMOC ON)
 
 include(GNUInstallDirs)
 
+# Qt remains for the phi-cli client binary only; the plugin itself runs on
+# the runtime loop (contract 2.0.0) and is Qt-free.
 find_package(Qt6 REQUIRED COMPONENTS Core Network)
-find_package(phi-transport-api 1.6.0 CONFIG QUIET)
+find_package(nlohmann_json REQUIRED)
+find_package(phi-transport-api 2.0.0 CONFIG QUIET)
 
 if(NOT TARGET phicore::transport-api AND NOT TARGET phi_transport_api)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../phi-transport-api/CMakeLists.txt")
@@ -39,8 +42,7 @@ add_library(phi_transport_cli MODULE
 
 target_link_libraries(phi_transport_cli
     PRIVATE
-        Qt6::Core
-        Qt6::Network
+        nlohmann_json::nlohmann_json
         ${PHI_TRANSPORT_API_TARGET}
 )
 

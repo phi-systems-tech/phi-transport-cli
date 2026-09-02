@@ -1,30 +1,60 @@
 #include "clitransport.h"
 
-#include <QJsonArray>
-#include <QJsonObject>
-#include <QJsonValue>
-#include <QDateTime>
-#include <QDir>
-#include <QFile>
-#include <QJsonDocument>
-#include <QJsonParseError>
-#include <QLocalServer>
-#include <QLocalSocket>
+#include <nlohmann/json.hpp>
+
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
 
 namespace phicore::transport::cli {
 
 namespace {
+
+using Json = nlohmann::json;
 
 // Envelope types and the topics a transport produces itself come from
 // envelope.h: they are protocol surface, and a copy per transport is how two
 // wires drift apart.
 constexpr const char kDefaultSocketPath[] = "/var/lib/phi/@1/cli.sock";
 
+/// A line a client may grow before it is a protocol violation, not a command.
+constexpr std::size_t kMaxLineBytes = 4 * 1024 * 1024;
+
+std::string socketPathFromConfig(const Json &config)
+{
+    if (config.is_object()) {
+        const auto it = config.find("socketPath");
+        if (it != config.end() && it->is_string()) {
+            std::string configured = it->get<std::string>();
+            while (!configured.empty() && (configured.back() == ' ' || configured.back() == '\t'))
+                configured.pop_back();
+            if (!configured.empty())
+                return configured;
+        }
+    }
+    return kDefaultSocketPath;
+}
+
+std::optional<CmdId> readCid(const Json &value)
+{
+    if (value.is_number())
+        return cidFromNumber(value.get<double>());
+    if (value.is_string())
+        return cidFromString(value.get<std::string>());
+    return std::nullopt;
+}
+
 } // namespace
 
-CliTransport::CliTransport(QObject *parent)
-    : QObject(parent)
+CliTransport::~CliTransport()
 {
+    stop();
 }
 
 std::string CliTransport::pluginType() const
@@ -44,282 +74,302 @@ std::string CliTransport::description() const
 
 bool CliTransport::start(std::string_view configJson, std::string *errorString)
 {
-    // The private helpers below stay in QString; only the contract is Qt-free.
-    QString localError;
-    const auto reportError = [&]() {
+    const auto fail = [&](std::string message) {
         if (errorString)
-            *errorString = localError.toStdString();
+            *errorString = std::move(message);
         return false;
     };
-    // Config arrives as JSON text; parsed once here and used as before.
-    const QJsonObject config =
-        QJsonDocument::fromJson(QByteArray::fromRawData(configJson.data(),
-                                                       static_cast<qsizetype>(configJson.size())))
-            .object();
+
+    const Json config = Json::parse(configJson, nullptr, false);
     if (m_running)
         stop();
 
-    const QString socketPath = socketPathFromConfig(config);
-    if (socketPath.trimmed().isEmpty()) {
-        localError = QStringLiteral("Invalid socketPath");
-        return reportError();
+    const std::string socketPath = socketPathFromConfig(config);
+    if (socketPath.empty())
+        return fail("Invalid socketPath");
+    if (socketPath.size() >= sizeof(sockaddr_un{}.sun_path))
+        return fail("socketPath is longer than a unix socket path may be");
+
+    std::error_code ec;
+    const std::filesystem::path dir = std::filesystem::path(socketPath).parent_path();
+    if (!dir.empty()) {
+        std::filesystem::create_directories(dir, ec);
+        if (ec)
+            return fail("Failed to create socket directory: " + dir.string());
+    }
+    ::unlink(socketPath.c_str());
+
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return fail(std::string("socket() failed: ") + std::strerror(errno));
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, socketPath.c_str(), socketPath.size() + 1);
+    if (::bind(fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) < 0) {
+        const int err = errno;
+        ::close(fd);
+        return fail(std::string("bind() failed: ") + std::strerror(err));
+    }
+    // The socket file's permissions are the credential: owner and group only.
+    ::chmod(socketPath.c_str(), 0660);
+    if (::listen(fd, 16) < 0) {
+        const int err = errno;
+        ::close(fd);
+        ::unlink(socketPath.c_str());
+        return fail(std::string("listen() failed: ") + std::strerror(err));
     }
 
-    if (!startServer(socketPath, &localError))
-        return reportError();
-
+    m_listenFd = fd;
     m_socketPath = socketPath;
+    m_listenWatch = runtimeLoop()->watchFd(m_listenFd, phi::runtime::Loop::FdEvent::Read,
+                                           [this]() { acceptClients(); });
     m_running = true;
-    const std::string socketPathText = m_socketPath.toStdString();
     writeLog(LogLevel::Info,
              makeCategory(LogCategory::Transport),
              "CLI transport started on unix socket %1",
-             {Scalar{socketPathText}},
+             {Scalar{m_socketPath}},
              "cli.start",
-             jsonObject({{"socketPath", jsonQuoted(socketPathText)}}));
+             jsonObject({{"socketPath", jsonQuoted(m_socketPath)}}));
     return true;
 }
 
 void CliTransport::stop()
 {
-    if (!m_running && !m_server)
+    if (!m_running && m_listenFd < 0)
         return;
 
-    closeAllClients();
+    // stop() is a contract call on the loop's own thread and may run inside
+    // no watch callback of these clients, so the teardown is direct here.
+    for (auto &entry : m_clients) {
+        Client *client = entry.second.get();
+        client->closed = true;
+        client->readWatch.reset();
+        client->writeWatch.reset();
+        ::close(client->fd);
+    }
     m_clients.clear();
-    m_clientBuffers.clear();
     m_pendingCommands.clear();
+    closeListener();
+    m_running = false;
+}
 
-    if (m_server) {
-        m_server->close();
-        m_server->deleteLater();
-        m_server = nullptr;
+void CliTransport::closeListener()
+{
+    m_listenWatch.reset();
+    if (m_listenFd >= 0) {
+        ::close(m_listenFd);
+        m_listenFd = -1;
+    }
+    if (!m_socketPath.empty())
+        ::unlink(m_socketPath.c_str());
+    m_socketPath.clear();
+}
+
+void CliTransport::acceptClients()
+{
+    while (true) {
+        const int fd = ::accept4(m_listenFd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                return;
+            return; // transient accept errors: the watch will fire again
+        }
+
+        auto client = std::make_shared<Client>();
+        client->fd = fd;
+        Client *raw = client.get();
+        client->readWatch = runtimeLoop()->watchFd(fd, phi::runtime::Loop::FdEvent::Read,
+                                                   [this, raw]() { onClientReadable(raw); });
+        client->writeWatch = runtimeLoop()->watchFd(fd, phi::runtime::Loop::FdEvent::Write,
+                                                    [this, raw]() { onClientWritable(raw); });
+        client->writeWatch.setEnabled(false);
+        m_clients.emplace(fd, std::move(client));
+    }
+}
+
+void CliTransport::onClientReadable(Client *client)
+{
+    if (client->closed)
+        return;
+
+    char chunk[16 * 1024];
+    while (true) {
+        const ssize_t got = ::read(client->fd, chunk, sizeof(chunk));
+        if (got > 0) {
+            client->inBuffer.append(chunk, static_cast<std::size_t>(got));
+            continue;
+        }
+        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            break;
+        if (got < 0 && errno == EINTR)
+            continue;
+        dropClient(client->fd); // closed by the peer, or a read error
+        return;
     }
 
-    if (!m_socketPath.isEmpty())
-        QFile::remove(m_socketPath);
+    std::size_t start = 0;
+    while (!client->closed) {
+        const std::size_t newline = client->inBuffer.find('\n', start);
+        if (newline == std::string::npos)
+            break;
+        std::string_view line(client->inBuffer.data() + start, newline - start);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+            line.remove_suffix(1);
+        while (!line.empty() && (line.front() == ' '))
+            line.remove_prefix(1);
+        if (!line.empty())
+            processLine(client, line);
+        start = newline + 1;
+    }
+    client->inBuffer.erase(0, start);
+    if (client->inBuffer.size() > kMaxLineBytes)
+        dropClient(client->fd);
+}
 
-    m_socketPath.clear();
-    m_running = false;
+void CliTransport::onClientWritable(Client *client)
+{
+    if (client->closed)
+        return;
+    flushClient(client);
+}
+
+void CliTransport::flushClient(Client *client)
+{
+    while (!client->outBuffer.empty()) {
+        const ssize_t sent = ::write(client->fd, client->outBuffer.data(), client->outBuffer.size());
+        if (sent > 0) {
+            client->outBuffer.erase(0, static_cast<std::size_t>(sent));
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            client->writeWatch.setEnabled(true);
+            return;
+        }
+        if (sent < 0 && errno == EINTR)
+            continue;
+        dropClient(client->fd);
+        return;
+    }
+    client->writeWatch.setEnabled(false);
+}
+
+void CliTransport::dropClient(int fd)
+{
+    auto it = m_clients.find(fd);
+    if (it == m_clients.end())
+        return;
+    std::shared_ptr<Client> victim = std::move(it->second);
+    m_clients.erase(it);
+    victim->closed = true;
+
+    for (auto pendingIt = m_pendingCommands.begin(); pendingIt != m_pendingCommands.end();) {
+        if (pendingIt->second.clientFd == fd)
+            pendingIt = m_pendingCommands.erase(pendingIt);
+        else
+            ++pendingIt;
+    }
+
+    // The watches die on the next loop turn: this may run inside one of their
+    // own callbacks, and a watch must not be reset from inside itself.
+    runtimeLoop()->post([victim]() {
+        victim->readWatch.reset();
+        victim->writeWatch.reset();
+        ::close(victim->fd);
+    });
 }
 
 void CliTransport::onCoreAsyncResult(CmdId cmdId, std::string_view payloadJson)
 {
     auto it = m_pendingCommands.find(cmdId);
     if (it == m_pendingCommands.end()) {
-        const std::string cmdIdText = std::to_string(cmdId);
         writeLog(LogLevel::Warn,
                  makeCategory(LogCategory::Transport),
                  "No pending CLI command for cmdId=%1",
                  {Scalar{static_cast<std::int64_t>(cmdId)}},
                  "cli.asyncResultMissing",
-                 jsonObject({{"cmdId", cmdIdText}}));
+                 jsonObject({{"cmdId", std::to_string(cmdId)}}));
         return;
     }
 
-    const PendingCommand pending = it.value();
+    const PendingCommand pending = it->second;
     m_pendingCommands.erase(it);
 
-    QLocalSocket *socket = pending.socket.data();
-    if (!socket || socket->state() != QLocalSocket::ConnectedState)
+    auto clientIt = m_clients.find(pending.clientFd);
+    if (clientIt == m_clients.end())
         return;
-
-    sendCmdResponse(socket, pending.cid, pending.cmdTopic, payloadJson);
+    sendCmdResponse(clientIt->second.get(), pending.cid, pending.cmdTopic, payloadJson);
 }
 
 void CliTransport::onCoreEvent(std::string_view topic, std::string_view payloadJson)
 {
-    const QString topicText = QString::fromUtf8(topic.data(), static_cast<qsizetype>(topic.size()));
-    if (topicText.trimmed().isEmpty())
+    if (topic.empty())
         return;
     broadcastEvent(topic, payloadJson);
 }
 
-void CliTransport::onNewConnection()
-{
-    if (!m_server)
-        return;
-
-    while (m_server->hasPendingConnections()) {
-        QLocalSocket *socket = m_server->nextPendingConnection();
-        if (!socket)
-            continue;
-
-        m_clients.insert(socket);
-        m_clientBuffers.insert(socket, ClientBuffer{socket, {}});
-        connect(socket, &QLocalSocket::disconnected,
-                this, &CliTransport::onSocketDisconnected);
-        connect(socket, &QLocalSocket::readyRead,
-                this, &CliTransport::onSocketReadyRead);
-    }
-}
-
-void CliTransport::onSocketDisconnected()
-{
-    auto *socket = qobject_cast<QLocalSocket *>(sender());
-    if (!socket)
-        return;
-
-    m_clients.remove(socket);
-    m_clientBuffers.remove(socket);
-
-    for (auto it = m_pendingCommands.begin(); it != m_pendingCommands.end();) {
-        if (it.value().socket == socket)
-            it = m_pendingCommands.erase(it);
-        else
-            ++it;
-    }
-
-    socket->deleteLater();
-}
-
-void CliTransport::onSocketReadyRead()
-{
-    auto *socket = qobject_cast<QLocalSocket *>(sender());
-    if (!socket)
-        return;
-
-    auto it = m_clientBuffers.find(socket);
-    if (it == m_clientBuffers.end())
-        return;
-
-    it->buffer.append(socket->readAll());
-    while (true) {
-        const int newlinePos = it->buffer.indexOf('\n');
-        if (newlinePos < 0)
-            break;
-
-        const QByteArray line = it->buffer.left(newlinePos).trimmed();
-        it->buffer.remove(0, newlinePos + 1);
-        if (!line.isEmpty())
-            processLine(socket, line);
-    }
-}
-
-QString CliTransport::socketPathFromConfig(const QJsonObject &config)
-{
-    const QString configured = config.value(QStringLiteral("socketPath")).toString().trimmed();
-    if (!configured.isEmpty())
-        return configured;
-    return QString::fromLatin1(kDefaultSocketPath);
-}
-
-std::optional<CmdId> CliTransport::readCid(const QJsonValue &value)
-{
-    if (value.isDouble())
-        return cidFromNumber(value.toDouble(-1.0));
-    if (value.isString())
-        return cidFromString(value.toString().toStdString());
-    return std::nullopt;
-}
-
-bool CliTransport::startServer(const QString &socketPath, QString *errorString)
-{
-    const QFileInfo pathInfo(socketPath);
-    const QString dirPath = pathInfo.absolutePath();
-    if (dirPath.isEmpty() || !QDir().mkpath(dirPath)) {
-        if (errorString)
-            *errorString = QStringLiteral("Failed to create socket directory: %1").arg(dirPath);
-        return false;
-    }
-
-    QFile::remove(socketPath);
-
-    auto *server = new QLocalServer(this);
-    if (!server->listen(socketPath)) {
-        const QString err = server->errorString();
-        delete server;
-        if (errorString)
-            *errorString = err.isEmpty() ? QStringLiteral("Failed to listen on unix socket") : err;
-        return false;
-    }
-
-    QFile::setPermissions(socketPath,
-                          QFile::ReadOwner | QFile::WriteOwner
-                              | QFile::ReadGroup | QFile::WriteGroup);
-
-    connect(server, &QLocalServer::newConnection,
-            this, &CliTransport::onNewConnection);
-
-    m_server = server;
-    return true;
-}
-
-void CliTransport::closeAllClients()
-{
-    const QList<QLocalSocket *> clients = m_clients.values();
-    for (QLocalSocket *client : clients) {
-        if (!client)
-            continue;
-        client->disconnectFromServer();
-        client->close();
-        client->deleteLater();
-    }
-}
-
-// One Qt-side utility remains: turning a QJsonObject this transport built or
-// parsed into the text the boundary speaks.
-static JsonText jsonTextOf(const QJsonObject &object)
-{
-    if (object.isEmpty())
-        return emptyJsonObject();
-    const QByteArray bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
-    return JsonText(bytes.constData(), static_cast<std::size_t>(bytes.size()));
-}
-
-void CliTransport::send(QLocalSocket *socket,
+void CliTransport::send(Client *client,
                         std::string_view type,
                         std::string_view topic,
                         std::optional<CmdId> cid,
-                        std::string_view payloadJson) const
+                        std::string_view payloadJson)
 {
-    if (!socket || socket->state() != QLocalSocket::ConnectedState)
+    if (!client || client->closed)
         return;
 
     // The envelope shape comes from the shared header; the trailing newline is
     // this wire's framing and the only part that differs from the WS transport.
     JsonText out = makeEnvelope(type, topic, cid, payloadJson);
     out += '\n';
-    socket->write(out.data(), static_cast<qint64>(out.size()));
-    socket->flush();
+    client->outBuffer += out;
+    flushClient(client);
 }
 
-void CliTransport::sendProtocolError(QLocalSocket *socket,
+void CliTransport::sendProtocolError(Client *client,
                                      std::optional<CmdId> cid,
                                      std::string_view code,
-                                     std::string_view message) const
+                                     std::string_view message)
 {
-    send(socket, kEnvelopeTypeError, kTopicProtocolError, cid, makeProtocolErrorPayload(code, message));
+    send(client, kEnvelopeTypeError, kTopicProtocolError, cid, makeProtocolErrorPayload(code, message));
 }
 
-void CliTransport::sendCmdResponse(QLocalSocket *socket,
+void CliTransport::sendCmdResponse(Client *client,
                                    CmdId cid,
-                                   const QString &cmdTopic,
-                                   std::string_view payloadJson) const
+                                   const std::string &cmdTopic,
+                                   std::string_view payloadJson)
 {
     // The one outbound path that parses: `error: null` is added only if absent, and
     // deciding that from raw text would be a substring guess. Command responses are
     // user-driven, so the parse sits on the cheap side of the trade.
-    QJsonObject out =
-        QJsonDocument::fromJson(QByteArray::fromRawData(payloadJson.data(),
-                                                       static_cast<qsizetype>(payloadJson.size())))
-            .object();
-    out.insert(QStringLiteral("cmd"), cmdTopic);
-    if (!out.contains(QStringLiteral("error")))
-        out.insert(QStringLiteral("error"), QJsonValue::Null);
-    send(socket, kEnvelopeTypeResponse, kTopicCmdResponse, cid, jsonTextOf(out));
+    Json out = Json::parse(payloadJson, nullptr, false);
+    if (!out.is_object())
+        out = Json::object();
+    out["cmd"] = cmdTopic;
+    if (!out.contains("error"))
+        out["error"] = nullptr;
+    const std::string bytes = out.dump();
+    send(client, kEnvelopeTypeResponse, kTopicCmdResponse, cid, bytes);
 }
 
-void CliTransport::broadcastEvent(std::string_view topic, std::string_view payloadJson) const
+void CliTransport::broadcastEvent(std::string_view topic, std::string_view payloadJson)
 {
-    // No cid on events; otherwise the same envelope as everything else.
-    for (QLocalSocket *client : m_clients)
-        send(client, kEnvelopeTypeEvent, topic, std::nullopt, payloadJson);
+    // No cid on events; otherwise the same envelope as everything else. The
+    // client list may shrink underneath (a send failure drops the client), so
+    // the iteration works from a snapshot of the keys.
+    std::vector<int> fds;
+    fds.reserve(m_clients.size());
+    for (const auto &entry : m_clients)
+        fds.push_back(entry.first);
+    for (int fd : fds) {
+        auto it = m_clients.find(fd);
+        if (it != m_clients.end())
+            send(it->second.get(), kEnvelopeTypeEvent, topic, std::nullopt, payloadJson);
+    }
 }
 
-void CliTransport::handleCommand(QLocalSocket *socket,
+void CliTransport::handleCommand(Client *client,
                                  CmdId cid,
-                                 const QString &topic,
+                                 const std::string &topic,
                                  std::string_view payloadJson)
 {
     // Routing is the protocol's decision, made once in TransportPluginBase - this
@@ -332,57 +382,64 @@ void CliTransport::handleCommand(QLocalSocket *socket,
     // on the box. Core is told that rather than left to guess (F-60).
     CallerIdentity caller;
     caller.kind = CallerIdentity::Kind::TrustedLocal;
-    const CommandOutcome outcome = dispatchCommand(topic.toUtf8().toStdString(), payloadJson, caller);
+    const int clientFd = client->fd;
+    const CommandOutcome outcome = dispatchCommand(topic, payloadJson, caller);
+
+    // dispatchCommand can block on core; the client may have died meanwhile.
+    auto clientIt = m_clients.find(clientFd);
+    if (clientIt == m_clients.end())
+        return;
+    client = clientIt->second.get();
 
     if (outcome.cmdId > 0) {
         // Core took the command and answers later; the client waits under that id
         // until onCoreAsyncResult arrives.
         PendingCommand pending;
-        pending.socket = socket;
+        pending.clientFd = clientFd;
         pending.cid = cid;
         pending.cmdTopic = topic;
-        m_pendingCommands.insert(outcome.cmdId, pending);
+        m_pendingCommands.emplace(outcome.cmdId, pending);
     }
 
     const auto [type, envelopeTopic] = envelopeFor(outcome.kind);
-    send(socket, type, envelopeTopic, cid, outcome.payloadJson);
+    send(client, type, envelopeTopic, cid, outcome.payloadJson);
 }
 
-void CliTransport::processLine(QLocalSocket *socket, const QByteArray &line)
+void CliTransport::processLine(Client *client, std::string_view line)
 {
-    QJsonParseError parseError;
-    const QJsonDocument doc = QJsonDocument::fromJson(line, &parseError);
-    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
-        sendProtocolError(socket, std::nullopt, kErrorCodeInvalidJson, kMessageInvalidJson);
+    const Json doc = Json::parse(line, nullptr, false);
+    if (!doc.is_object()) {
+        sendProtocolError(client, std::nullopt, kErrorCodeInvalidJson, kMessageInvalidJson);
         return;
     }
 
-    const QJsonObject obj = doc.object();
-    const QString type = obj.value(QStringLiteral("type")).toString();
-    const QString topic = obj.value(QStringLiteral("topic")).toString();
-    const QJsonObject payload = obj.value(QStringLiteral("payload")).toObject();
+    const std::string type = doc.value("type", std::string());
+    std::string topic = doc.value("topic", std::string());
+    const Json payload = doc.contains("payload") && doc["payload"].is_object()
+        ? doc["payload"] : Json::object();
 
-    const std::optional<CmdId> cid = readCid(obj.value(QStringLiteral("cid")));
+    const std::optional<CmdId> cid = readCid(doc.contains("cid") ? doc["cid"] : Json());
     if (!cid.has_value()) {
-        sendProtocolError(socket, std::nullopt, kErrorCodeMissingCid, kMessageMissingCid);
+        sendProtocolError(client, std::nullopt, kErrorCodeMissingCid, kMessageMissingCid);
         return;
     }
 
-    if (type.toStdString() != kEnvelopeTypeCmd) {
-        sendProtocolError(socket, cid, kErrorCodeInvalidType, kMessageInvalidType);
+    if (type != kEnvelopeTypeCmd) {
+        sendProtocolError(client, cid, kErrorCodeInvalidType, kMessageInvalidType);
         return;
     }
 
-    if (topic.trimmed().isEmpty()) {
-        sendProtocolError(socket, cid, kErrorCodeMissingTopic, kMessageMissingTopic);
+    while (!topic.empty() && (topic.back() == ' ' || topic.back() == '\t'))
+        topic.pop_back();
+    if (topic.empty()) {
+        sendProtocolError(client, cid, kErrorCodeMissingTopic, kMessageMissingTopic);
         return;
     }
 
     // The API takes the payload as text; the frame was parsed to read the envelope, so
     // the sub-object is serialized once here. That is the cost side of the text
     // boundary, and it sits on the command path rather than the event path.
-    const JsonText payloadJson = jsonTextOf(payload);
-    handleCommand(socket, *cid, topic, payloadJson);
+    handleCommand(client, *cid, topic, payload.dump());
 }
 
 } // namespace phicore::transport::cli
