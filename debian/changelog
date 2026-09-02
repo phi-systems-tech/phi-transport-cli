@@ -1,3 +1,11 @@
+phi-transport-cli (0.0~git202609021519.dd5495b-1) unstable; urgency=medium
+
+  * Contract 2.0.0: the plugin runs on the runtime loop core provides -
+    a Qt-free unix-socket server on Loop watches. Depends on
+    libphi-runtime0 through shlibdeps; phi-cli itself is unchanged.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Wed, 02 Sep 2026 15:19:05 +0200
+
 phi-transport-cli (0.0~git202608301404.e93ff68-1) trixie; urgency=medium
 
   * adapter rescan, which phi-core's dpkg trigger calls when an adapter
