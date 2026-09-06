@@ -16,7 +16,7 @@ include(GNUInstallDirs)
 # the runtime loop (contract 2.0.0) and is Qt-free.
 find_package(Qt6 REQUIRED COMPONENTS Core Network)
 find_package(nlohmann_json REQUIRED)
-find_package(phi-transport-api 2.0.0 CONFIG QUIET)
+find_package(phi-transport-api 2.1.0 CONFIG QUIET)
 
 if(NOT TARGET phicore::transport-api AND NOT TARGET phi_transport_api)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../phi-transport-api/CMakeLists.txt")
