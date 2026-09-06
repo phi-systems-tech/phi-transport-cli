@@ -1,3 +1,10 @@
+phi-transport-cli (0.0~git202609060740.c661b47-1) unstable; urgency=medium
+
+  * Contract 2.1.0: rebuilt against the management surface; nothing to
+    manage here, so the surface stays empty.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Sun, 06 Sep 2026 07:40:05 +0200
+
 phi-transport-cli (0.0~git202609021519.dd5495b-1) unstable; urgency=medium
 
   * Contract 2.0.0: the plugin runs on the runtime loop core provides -
