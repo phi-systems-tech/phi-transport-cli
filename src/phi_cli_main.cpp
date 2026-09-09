@@ -1,15 +1,26 @@
-#include <QCoreApplication>
-#include <QDateTime>
-#include <QDir>
-#include <QJsonArray>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QLocalSocket>
-#include <QRegularExpression>
-#include <QTextStream>
+// phi-cli: the local client for the tenant's CLI transport socket.
+//
+// Qt-free (the Qt exit, last consumer of Qt6 in this repo): JSON is nlohmann,
+// like the transport plugin beside it; the envelope types, the response topics
+// and the cid rules come from phi/transport/api/envelope.h rather than from
+// string literals typed a second time here; and the socket is cli_socket.h,
+// which is QLocalSocket's waitFor... trio written as poll().
 
+#include "cli_socket.h"
+
+#include <envelope.h>
+#include <nlohmann/json.hpp>
+#include <phi/runtime/str.h>
+
+#include <chrono>
 #include <cerrno>
 #include <cstring>
+#include <iostream>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
 #include <pwd.h>
 #include <grp.h>
 #include <sys/types.h>
@@ -17,452 +28,443 @@
 
 namespace {
 
+using Json = nlohmann::json;
+namespace str = phi::str;
+namespace tapi = phicore::transport;
+
 constexpr const char kDefaultTenant[] = "1";
 constexpr int kConnectTimeoutMs = 2000;
 constexpr int kWriteTimeoutMs = 2000;
 constexpr int kResponseTimeoutMs = 15000;
 constexpr int kDiscoveryTimeoutMs = 30000;
 
-bool isValidTenant(const QString &tenant)
+std::int64_t nowMs()
 {
-    static const QRegularExpression pattern(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9._-]*$"));
-    return pattern.match(tenant).hasMatch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
-QString defaultSocketPathForTenant(const QString &tenant)
+// ------------------------------------------------------------------ JSON
+
+Json parseJson(std::string_view text)
 {
-    return QDir(QStringLiteral("/var/lib/phi")).filePath(QStringLiteral("@%1/cli.sock").arg(tenant));
+    const Json parsed = Json::parse(text, nullptr, false);
+    return parsed.is_discarded() ? Json() : parsed;
+}
+
+Json jsonValue(const Json &obj, std::string_view key)
+{
+    if (!obj.is_object())
+        return Json();
+    const auto it = obj.find(key);
+    return it == obj.end() ? Json() : *it;
+}
+
+Json jsonObject(const Json &obj, std::string_view key)
+{
+    const Json value = jsonValue(obj, key);
+    return value.is_object() ? value : Json::object();
+}
+
+Json jsonArray(const Json &obj, std::string_view key)
+{
+    const Json value = jsonValue(obj, key);
+    return value.is_array() ? value : Json::array();
+}
+
+std::string jsonString(const Json &obj, std::string_view key)
+{
+    const Json value = jsonValue(obj, key);
+    return value.is_string() ? value.get<std::string>() : std::string();
+}
+
+bool jsonBool(const Json &obj, std::string_view key, bool fallback = false)
+{
+    const Json value = jsonValue(obj, key);
+    return value.is_boolean() ? value.get<bool>() : fallback;
+}
+
+/// A scalar as text, the way QJsonValue::toVariant().toString() rendered it:
+/// strings as they are, numbers and booleans spelled out, anything else empty.
+std::string scalarText(const Json &value)
+{
+    if (value.is_string())
+        return value.get<std::string>();
+    if (value.is_boolean())
+        return value.get<bool>() ? "true" : "false";
+    if (value.is_number_integer())
+        return str::number(value.get<long long>());
+    if (value.is_number_unsigned())
+        return str::number(value.get<unsigned long long>());
+    if (value.is_number_float())
+        return str::number(value.get<double>());
+    return {};
+}
+
+/// QJsonDocument::toJson(Indented): four spaces, and a newline at the end.
+std::string dumpIndented(const Json &value)
+{
+    return value.dump(4, ' ', false, Json::error_handler_t::replace) + "\n";
+}
+
+std::string dumpCompact(const Json &value)
+{
+    return value.dump(-1, ' ', false, Json::error_handler_t::replace);
+}
+
+/// An integer that may have arrived as a number or as a numeric string -
+/// QVariant::toInt() across both. Nothing when it is neither.
+std::optional<int> jsonInt(const Json &value)
+{
+    if (value.is_number_integer())
+        return static_cast<int>(value.get<long long>());
+    if (value.is_number_float())
+        return static_cast<int>(value.get<double>());
+    if (value.is_string()) {
+        bool ok = false;
+        const int parsed = str::toInt(str::trimmed(value.get<std::string>()), &ok);
+        if (ok)
+            return parsed;
+    }
+    return std::nullopt;
+}
+
+std::optional<tapi::CmdId> readCid(const Json &value)
+{
+    // The contract's own rules, rather than a second reading of them here.
+    if (value.is_number())
+        return tapi::cidFromNumber(value.get<double>());
+    if (value.is_string())
+        return tapi::cidFromString(value.get<std::string>());
+    return std::nullopt;
+}
+
+// ------------------------------------------------------------------ output
+
+/// One table cell: left-aligned in `width`, never truncated - QTextStream's
+/// setFieldWidth with AlignLeft, which also let a long value run over.
+std::string cell(const std::string &text, std::size_t width)
+{
+    if (text.size() >= width)
+        return text;
+    return text + std::string(width - text.size(), ' ');
+}
+
+bool isValidTenant(const std::string &tenant)
+{
+    // ^[A-Za-z0-9][A-Za-z0-9._-]*$ - a tenant names a directory under
+    // /var/lib/phi, so nothing that could walk out of it.
+    if (tenant.empty())
+        return false;
+    const auto isAlnum = [](char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    };
+    if (!isAlnum(tenant.front()))
+        return false;
+    for (const char c : tenant) {
+        if (!isAlnum(c) && c != '.' && c != '_' && c != '-')
+            return false;
+    }
+    return true;
+}
+
+std::string defaultSocketPathForTenant(const std::string &tenant)
+{
+    return "/var/lib/phi/@" + tenant + "/cli.sock";
 }
 
 void printUsage()
 {
-    QTextStream out(stdout);
-    out << "Usage:\n";
-    out << "  phi-cli discover [--tenant <tenant>] [--socket <path>] [--json]\n";
-    out << "  phi-cli adapter list [--tenant <tenant>] [--socket <path>] [--json]\n";
-    out << "  phi-cli adapter discover [<plugin>] [--tenant <tenant>] [--socket <path>] [--json]\n";
-    out << "  phi-cli adapter start|stop|restart (--id <id> | --external-id <id> | --name <name>) [--tenant <tenant>] [--socket <path>]\n";
-    out << "  phi-cli adapter start|stop|restart <plugin> --all [--tenant <tenant>] [--socket <path>]\n";
-    out << "  phi-cli adapter reload <plugin> [--tenant <tenant>] [--socket <path>]\n";
-    out << "  phi-cli adapter rescan [--tenant <tenant>] [--socket <path>]\n";
-    out << "  phi-cli adapter invoke <actionId> (--id <id> | --external-id <id> | --name <name>) [--params <json>] [--json] [--tenant <tenant>] [--socket <path>]\n";
-    out << "  phi-cli transport start|stop|restart|reload <plugin> [--tenant <tenant>] [--socket <path>]\n";
+    std::cout
+        << "Usage:\n"
+        << "  phi-cli discover [--tenant <tenant>] [--socket <path>] [--json]\n"
+        << "  phi-cli adapter list [--tenant <tenant>] [--socket <path>] [--json]\n"
+        << "  phi-cli adapter discover [<plugin>] [--tenant <tenant>] [--socket <path>] [--json]\n"
+        << "  phi-cli adapter start|stop|restart (--id <id> | --external-id <id> | --name <name>) [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli adapter start|stop|restart <plugin> --all [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli adapter reload <plugin> [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli adapter rescan [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli adapter invoke <actionId> (--id <id> | --external-id <id> | --name <name>) [--params <json>] [--json] [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli transport start|stop|restart|reload <plugin> [--tenant <tenant>] [--socket <path>]\n";
 }
 
-bool tryReadCid(const QJsonValue &value, quint64 *cidOut)
+std::string boolText(bool value)
 {
-    if (!cidOut)
-        return false;
-    if (value.isDouble()) {
-        const double raw = value.toDouble(-1.0);
-        if (raw < 0.0)
-            return false;
-        *cidOut = static_cast<quint64>(raw);
-        return true;
-    }
-    if (value.isString()) {
-        bool ok = false;
-        const quint64 parsed = value.toString().toULongLong(&ok);
-        if (!ok)
-            return false;
-        *cidOut = parsed;
-        return true;
-    }
-    return false;
+    return value ? "yes" : "no";
 }
 
-QString boolText(bool value)
+void printAdapterTable(const Json &adapters)
 {
-    return value ? QStringLiteral("yes") : QStringLiteral("no");
-}
+    std::cout << cell("ID", 8) << cell("PLUGIN", 16) << cell("EXTERNAL_ID", 20)
+              << cell("NAME", 28) << cell("ENABLED", 10) << cell("RUNNING", 10)
+              << cell("CONNECTED", 10) << "\n";
 
-void printAdapterTable(const QJsonArray &adapters)
-{
-    QTextStream out(stdout);
-    out.setFieldAlignment(QTextStream::AlignLeft);
-    out.setFieldWidth(8);
-    out << "ID";
-    out.setFieldWidth(16);
-    out << "PLUGIN";
-    out.setFieldWidth(20);
-    out << "EXTERNAL_ID";
-    out.setFieldWidth(28);
-    out << "NAME";
-    out.setFieldWidth(10);
-    out << "ENABLED";
-    out.setFieldWidth(10);
-    out << "RUNNING";
-    out.setFieldWidth(10);
-    out << "CONNECTED";
-    out.setFieldWidth(0);
-    out << "\n";
-
-    for (const QJsonValue &entry : adapters) {
-        const QJsonObject obj = entry.toObject();
-        const QString id = obj.value(QStringLiteral("id")).toVariant().toString();
-        const QString pluginType = obj.value(QStringLiteral("pluginType")).toString();
-        const QString externalId = obj.value(QStringLiteral("externalId")).toString();
-        const QString name = obj.value(QStringLiteral("name")).toString();
-        const QString enabled = boolText(obj.value(QStringLiteral("enabled")).toBool(false));
-        const QString running = boolText(obj.value(QStringLiteral("running")).toBool(false));
-        const QString connected = boolText(obj.value(QStringLiteral("connected")).toBool(false));
-
-        out.setFieldWidth(8);
-        out << id;
-        out.setFieldWidth(16);
-        out << pluginType;
-        out.setFieldWidth(20);
-        out << externalId;
-        out.setFieldWidth(28);
-        out << name;
-        out.setFieldWidth(10);
-        out << enabled;
-        out.setFieldWidth(10);
-        out << running;
-        out.setFieldWidth(10);
-        out << connected;
-        out.setFieldWidth(0);
-        out << "\n";
+    for (const Json &entry : adapters) {
+        std::cout << cell(scalarText(jsonValue(entry, "id")), 8)
+                  << cell(jsonString(entry, "pluginType"), 16)
+                  << cell(jsonString(entry, "externalId"), 20)
+                  << cell(jsonString(entry, "name"), 28)
+                  << cell(boolText(jsonBool(entry, "enabled")), 10)
+                  << cell(boolText(jsonBool(entry, "running")), 10)
+                  << cell(boolText(jsonBool(entry, "connected")), 10) << "\n";
     }
 }
 
-void printDiscoveryTable(const QJsonArray &candidates)
+void printDiscoveryTable(const Json &candidates)
 {
-    QTextStream out(stdout);
-    out.setFieldAlignment(QTextStream::AlignLeft);
-    out.setFieldWidth(16);
-    out << "PLUGIN";
-    out.setFieldWidth(12);
-    out << "PROVIDER";
-    out.setFieldWidth(28);
-    out << "LABEL";
-    out.setFieldWidth(22);
-    out << "EXTERNAL_ID";
-    out.setFieldWidth(24);
-    out << "HOST";
-    out.setFieldWidth(18);
-    out << "IP";
-    out.setFieldWidth(8);
-    out << "PORT";
-    out.setFieldWidth(12);
-    out << "SERVICE";
-    out.setFieldWidth(0);
-    out << "\n";
+    std::cout << cell("PLUGIN", 16) << cell("PROVIDER", 12) << cell("LABEL", 28)
+              << cell("EXTERNAL_ID", 22) << cell("HOST", 24) << cell("IP", 18)
+              << cell("PORT", 8) << cell("SERVICE", 12) << "\n";
 
-    for (const QJsonValue &entry : candidates) {
-        const QJsonObject obj = entry.toObject();
-        const QString plugin = obj.value(QStringLiteral("plugin")).toString();
-        const QString provider = obj.value(QStringLiteral("provider")).toString();
-        const QString label = obj.value(QStringLiteral("label")).toString();
-        const QString externalId = obj.value(QStringLiteral("externalId")).toString();
-        const QString host = obj.value(QStringLiteral("hostname")).toString();
-        const QString ip = obj.value(QStringLiteral("ip")).toString();
-        const QString port = obj.value(QStringLiteral("port")).toVariant().toString();
-        const QString service = obj.value(QStringLiteral("service")).toString();
-
-        out.setFieldWidth(16);
-        out << plugin;
-        out.setFieldWidth(12);
-        out << provider;
-        out.setFieldWidth(28);
-        out << label;
-        out.setFieldWidth(22);
-        out << externalId;
-        out.setFieldWidth(24);
-        out << host;
-        out.setFieldWidth(18);
-        out << ip;
-        out.setFieldWidth(8);
-        out << port;
-        out.setFieldWidth(12);
-        out << service;
-        out.setFieldWidth(0);
-        out << "\n";
+    for (const Json &entry : candidates) {
+        std::cout << cell(jsonString(entry, "plugin"), 16)
+                  << cell(jsonString(entry, "provider"), 12)
+                  << cell(jsonString(entry, "label"), 28)
+                  << cell(jsonString(entry, "externalId"), 22)
+                  << cell(jsonString(entry, "hostname"), 24)
+                  << cell(jsonString(entry, "ip"), 18)
+                  << cell(scalarText(jsonValue(entry, "port")), 8)
+                  << cell(jsonString(entry, "service"), 12) << "\n";
     }
 }
 
-QString responseErrorMessage(const QJsonObject &payload)
+std::string responseErrorMessage(const Json &payload)
 {
-    const QJsonValue errorValue = payload.value(QStringLiteral("error"));
-    if (errorValue.isObject()) {
-        const QJsonObject errObj = errorValue.toObject();
-        const QString msg = errObj.value(QStringLiteral("msg")).toString();
-        if (!msg.isEmpty())
+    const Json errorValue = jsonValue(payload, "error");
+    if (errorValue.is_object()) {
+        const std::string msg = jsonString(errorValue, "msg");
+        if (!msg.empty())
             return msg;
-        return errObj.value(QStringLiteral("message")).toString();
+        return jsonString(errorValue, "message");
     }
-    if (errorValue.isString())
-        return errorValue.toString();
+    if (errorValue.is_string())
+        return errorValue.get<std::string>();
     return {};
 }
 
-bool sendCommand(const QString &socketPath,
-                 const QString &topic,
-                 const QJsonObject &payload,
-                 QJsonObject *responsePayload,
-                 QString *errorOut)
+// ------------------------------------------------------------------ protocol
+
+Json commandEnvelope(tapi::CmdId cid, const std::string &topic, const Json &payload)
 {
-    QLocalSocket socket;
-    socket.connectToServer(socketPath);
-    if (!socket.waitForConnected(kConnectTimeoutMs)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("Failed to connect to socket: %1").arg(socketPath);
+    Json request = Json::object();
+    request["type"] = tapi::kEnvelopeTypeCmd;
+    request["cid"] = cid;
+    request["topic"] = topic;
+    request["payload"] = payload;
+    return request;
+}
+
+bool sendCommand(const std::string &socketPath,
+                 const std::string &topic,
+                 const Json &payload,
+                 Json *responsePayload,
+                 std::string *errorOut)
+{
+    phicore::cli::LineSocket socket;
+    if (!socket.connect(socketPath, kConnectTimeoutMs, errorOut))
         return false;
-    }
 
-    const quint64 cid = static_cast<quint64>(QDateTime::currentMSecsSinceEpoch());
-
-    QJsonObject request;
-    request.insert(QStringLiteral("type"), QStringLiteral("cmd"));
-    request.insert(QStringLiteral("cid"), static_cast<qint64>(cid));
-    request.insert(QStringLiteral("topic"), topic);
-    request.insert(QStringLiteral("payload"), payload);
-
-    const QByteArray wire = QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n';
-    socket.write(wire);
-    if (!socket.waitForBytesWritten(kWriteTimeoutMs)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("Failed to send request");
+    const auto cid = static_cast<tapi::CmdId>(nowMs());
+    if (!socket.writeAll(dumpCompact(commandEnvelope(cid, topic, payload)) + "\n",
+                         kWriteTimeoutMs, errorOut))
         return false;
-    }
 
-    QByteArray buffer;
     bool ackSeen = false;
     while (true) {
-        if (!socket.waitForReadyRead(kResponseTimeoutMs)) {
+        std::string line;
+        const auto read = socket.readLine(kResponseTimeoutMs, &line, errorOut);
+        if (read == phicore::cli::LineSocket::Read::Timeout) {
             if (errorOut)
-                *errorOut = QStringLiteral("Timeout waiting for response");
+                *errorOut = "Timeout waiting for response";
             return false;
         }
-        buffer.append(socket.readAll());
+        if (read == phicore::cli::LineSocket::Read::Closed) {
+            if (errorOut) {
+                *errorOut = ackSeen ? "Connection closed before command response"
+                                    : "Connection closed before the command was acknowledged";
+            }
+            return false;
+        }
+        if (read == phicore::cli::LineSocket::Read::Failed)
+            return false;
 
-        while (true) {
-            const int newlinePos = buffer.indexOf('\n');
-            if (newlinePos < 0)
-                break;
-            const QByteArray line = buffer.left(newlinePos).trimmed();
-            buffer.remove(0, newlinePos + 1);
-            if (line.isEmpty())
-                continue;
+        const Json envelope = parseJson(str::trimmed(line));
+        if (!envelope.is_object())
+            continue;
 
-            QJsonParseError parseError;
-            const QJsonDocument doc = QJsonDocument::fromJson(line, &parseError);
-            if (parseError.error != QJsonParseError::NoError || !doc.isObject())
-                continue;
+        const auto responseCid = readCid(jsonValue(envelope, "cid"));
+        if (!responseCid.has_value() || *responseCid != cid)
+            continue;
 
-            const QJsonObject obj = doc.object();
-            quint64 responseCid = 0;
-            if (!tryReadCid(obj.value(QStringLiteral("cid")), &responseCid) || responseCid != cid)
-                continue;
+        const std::string type = jsonString(envelope, "type");
+        const std::string responseTopic = jsonString(envelope, "topic");
+        const Json response = jsonObject(envelope, "payload");
 
-            const QString type = obj.value(QStringLiteral("type")).toString();
-            const QString responseTopic = obj.value(QStringLiteral("topic")).toString();
-            const QJsonObject response = obj.value(QStringLiteral("payload")).toObject();
-
-            if (type == QStringLiteral("response") && responseTopic == QStringLiteral("cmd.ack")) {
-                ackSeen = true;
-                if (!response.value(QStringLiteral("accepted")).toBool()) {
-                    if (errorOut) {
-                        const QString err = responseErrorMessage(response);
-                        *errorOut = QStringLiteral("Command rejected: %1")
-                                        .arg(err.isEmpty() ? QStringLiteral("unknown error") : err);
-                    }
-                    return false;
+        if (type == tapi::kEnvelopeTypeResponse && responseTopic == tapi::kTopicCmdAck) {
+            ackSeen = true;
+            if (!jsonBool(response, "accepted")) {
+                if (errorOut) {
+                    const std::string err = responseErrorMessage(response);
+                    *errorOut = "Command rejected: " + (err.empty() ? std::string("unknown error") : err);
                 }
-                continue;
-            }
-
-            if (type == QStringLiteral("response") && responseTopic == QStringLiteral("cmd.response")) {
-                if (responsePayload)
-                    *responsePayload = response;
-                return true;
-            }
-
-            if (type == QStringLiteral("error") && responseTopic == QStringLiteral("protocol.error")) {
-                if (errorOut)
-                    *errorOut = QStringLiteral("Protocol error: %1")
-                                    .arg(response.value(QStringLiteral("message")).toString());
                 return false;
             }
+            continue;
         }
 
-        if (ackSeen && socket.state() != QLocalSocket::ConnectedState) {
+        if (type == tapi::kEnvelopeTypeResponse && responseTopic == tapi::kTopicCmdResponse) {
+            if (responsePayload)
+                *responsePayload = response;
+            return true;
+        }
+
+        if (type == tapi::kEnvelopeTypeError && responseTopic == tapi::kTopicProtocolError) {
             if (errorOut)
-                *errorOut = QStringLiteral("Connection closed before command response");
+                *errorOut = "Protocol error: " + jsonString(response, "message");
             return false;
         }
     }
 }
 
-bool fetchAdapters(const QString &socketPath, QJsonArray *adaptersOut, QString *errorOut)
+bool fetchAdapters(const std::string &socketPath, Json *adaptersOut, std::string *errorOut)
 {
-    QJsonObject response;
-    if (!sendCommand(socketPath, QStringLiteral("cmd.adapters.list"), QJsonObject{}, &response, errorOut))
+    Json response;
+    if (!sendCommand(socketPath, "cmd.adapters.list", Json::object(), &response, errorOut))
         return false;
     if (adaptersOut)
-        *adaptersOut = response.value(QStringLiteral("adapters")).toArray();
+        *adaptersOut = jsonArray(response, "adapters");
     return true;
 }
 
-QJsonObject sanitizeDiscoveryCandidate(QJsonObject candidate)
+Json sanitizeDiscoveryCandidate(Json candidate)
 {
-    candidate.remove(QStringLiteral("cmd"));
-    candidate.remove(QStringLiteral("seq"));
-    candidate.remove(QStringLiteral("tsMs"));
-    candidate.remove(QStringLiteral("streamId"));
+    candidate.erase("cmd");
+    candidate.erase("seq");
+    candidate.erase("tsMs");
+    candidate.erase("streamId");
     return candidate;
 }
 
-bool runDiscoveryStream(const QString &socketPath,
-                        const QString &kind,
-                        const QStringList &pluginTypes,
-                        QJsonArray *candidatesOut,
-                        QString *errorOut)
+bool runDiscoveryStream(const std::string &socketPath,
+                        const std::string &kind,
+                        const std::vector<std::string> &pluginTypes,
+                        Json *candidatesOut,
+                        std::string *errorOut)
 {
-    QLocalSocket socket;
-    socket.connectToServer(socketPath);
-    if (!socket.waitForConnected(kConnectTimeoutMs)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("Failed to connect to socket: %1").arg(socketPath);
+    phicore::cli::LineSocket socket;
+    if (!socket.connect(socketPath, kConnectTimeoutMs, errorOut))
         return false;
-    }
 
-    const quint64 cid = static_cast<quint64>(QDateTime::currentMSecsSinceEpoch());
+    const auto cid = static_cast<tapi::CmdId>(nowMs());
 
-    QJsonObject params;
-    if (!pluginTypes.isEmpty()) {
-        QJsonArray pluginArray;
-        for (const QString &pluginType : pluginTypes)
-            pluginArray.append(pluginType);
-        params.insert(QStringLiteral("pluginTypes"), pluginArray);
-    }
+    Json params = Json::object();
+    if (!pluginTypes.empty())
+        params["pluginTypes"] = pluginTypes;
 
-    QJsonObject payload;
-    payload.insert(QStringLiteral("kind"), kind);
-    payload.insert(QStringLiteral("params"), params);
+    Json payload = Json::object();
+    payload["kind"] = kind;
+    payload["params"] = params;
 
-    QJsonObject request;
-    request.insert(QStringLiteral("type"), QStringLiteral("cmd"));
-    request.insert(QStringLiteral("cid"), static_cast<qint64>(cid));
-    request.insert(QStringLiteral("topic"), QStringLiteral("cmd.stream.start"));
-    request.insert(QStringLiteral("payload"), payload);
-
-    const QByteArray wire = QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n';
-    socket.write(wire);
-    if (!socket.waitForBytesWritten(kWriteTimeoutMs)) {
-        if (errorOut)
-            *errorOut = QStringLiteral("Failed to send request");
+    if (!socket.writeAll(dumpCompact(commandEnvelope(cid, "cmd.stream.start", payload)) + "\n",
+                         kWriteTimeoutMs, errorOut))
         return false;
-    }
 
-    QByteArray buffer;
-    QString streamId;
-    QJsonArray candidates;
-    const qint64 deadlineMs = QDateTime::currentMSecsSinceEpoch() + kDiscoveryTimeoutMs;
+    std::string streamId;
+    Json candidates = Json::array();
+    const std::int64_t deadlineMs = nowMs() + kDiscoveryTimeoutMs;
 
-    auto remainingMs = [&]() -> int {
-        return static_cast<int>(qMax<qint64>(1, deadlineMs - QDateTime::currentMSecsSinceEpoch()));
-    };
-
-    while (QDateTime::currentMSecsSinceEpoch() < deadlineMs) {
-        if (!socket.waitForReadyRead(remainingMs())) {
+    while (nowMs() < deadlineMs) {
+        const auto remainingMs = static_cast<int>(std::max<std::int64_t>(1, deadlineMs - nowMs()));
+        std::string line;
+        const auto read = socket.readLine(remainingMs, &line, errorOut);
+        if (read == phicore::cli::LineSocket::Read::Timeout)
+            break;
+        if (read == phicore::cli::LineSocket::Read::Closed) {
             if (errorOut)
-                *errorOut = QStringLiteral("Timeout waiting for discovery stream");
+                *errorOut = "Connection closed before the discovery stream ended";
             return false;
         }
-        buffer.append(socket.readAll());
+        if (read == phicore::cli::LineSocket::Read::Failed)
+            return false;
 
-        while (true) {
-            const int newlinePos = buffer.indexOf('\n');
-            if (newlinePos < 0)
-                break;
-            const QByteArray line = buffer.left(newlinePos).trimmed();
-            buffer.remove(0, newlinePos + 1);
-            if (line.isEmpty())
-                continue;
+        const Json envelope = parseJson(str::trimmed(line));
+        if (!envelope.is_object())
+            continue;
 
-            QJsonParseError parseError;
-            const QJsonDocument doc = QJsonDocument::fromJson(line, &parseError);
-            if (parseError.error != QJsonParseError::NoError || !doc.isObject())
-                continue;
+        const std::string type = jsonString(envelope, "type");
+        const std::string topic = jsonString(envelope, "topic");
+        const Json response = jsonObject(envelope, "payload");
 
-            const QJsonObject obj = doc.object();
-            const QString type = obj.value(QStringLiteral("type")).toString();
-            const QString topic = obj.value(QStringLiteral("topic")).toString();
-            const QJsonObject response = obj.value(QStringLiteral("payload")).toObject();
+        const auto responseCid = readCid(jsonValue(envelope, "cid"));
+        const bool cidMatches = responseCid.has_value() && *responseCid == cid;
 
-            quint64 responseCid = 0;
-            const bool cidMatches = tryReadCid(obj.value(QStringLiteral("cid")), &responseCid) && responseCid == cid;
-
-            if (type == QStringLiteral("response") && topic == QStringLiteral("cmd.ack") && cidMatches) {
-                if (!response.value(QStringLiteral("accepted")).toBool()) {
-                    if (errorOut) {
-                        const QString err = responseErrorMessage(response);
-                        *errorOut = QStringLiteral("Command rejected: %1")
-                                        .arg(err.isEmpty() ? QStringLiteral("unknown error") : err);
-                    }
-                    return false;
-                }
-                continue;
-            }
-
-            if (type == QStringLiteral("response") && topic == QStringLiteral("cmd.response") && cidMatches) {
-                streamId = response.value(QStringLiteral("streamId")).toString().trimmed();
-                if (streamId.isEmpty()) {
-                    if (errorOut)
-                        *errorOut = QStringLiteral("Discovery response did not include a streamId");
-                    return false;
-                }
-                continue;
-            }
-
-            if (type == QStringLiteral("error") && topic == QStringLiteral("protocol.error")) {
-                if (errorOut)
-                    *errorOut = QStringLiteral("Protocol error: %1")
-                                    .arg(response.value(QStringLiteral("message")).toString());
-                return false;
-            }
-
-            if (streamId.isEmpty())
-                continue;
-
-            const QString payloadStreamId = response.value(QStringLiteral("streamId")).toString().trimmed();
-            const QString payloadCmd = response.value(QStringLiteral("cmd")).toString();
-            if (payloadStreamId != streamId || payloadCmd != QStringLiteral("cmd.stream.start"))
-                continue;
-
-            if (type == QStringLiteral("event") && topic == QStringLiteral("stream.data")) {
-                candidates.append(sanitizeDiscoveryCandidate(response));
-                continue;
-            }
-
-            if (type == QStringLiteral("event") && topic == QStringLiteral("stream.error")) {
+        if (type == tapi::kEnvelopeTypeResponse && topic == tapi::kTopicCmdAck && cidMatches) {
+            if (!jsonBool(response, "accepted")) {
                 if (errorOut) {
-                    const QString err = responseErrorMessage(response);
-                    *errorOut = err.isEmpty()
-                        ? QStringLiteral("Discovery stream failed")
-                        : err;
+                    const std::string err = responseErrorMessage(response);
+                    *errorOut = "Command rejected: " + (err.empty() ? std::string("unknown error") : err);
                 }
                 return false;
             }
+            continue;
+        }
 
-            if (type == QStringLiteral("event") && topic == QStringLiteral("stream.end")) {
-                if (candidatesOut)
-                    *candidatesOut = candidates;
-                return true;
+        if (type == tapi::kEnvelopeTypeResponse && topic == tapi::kTopicCmdResponse && cidMatches) {
+            streamId = str::trimmed(jsonString(response, "streamId"));
+            if (streamId.empty()) {
+                if (errorOut)
+                    *errorOut = "Discovery response did not include a streamId";
+                return false;
             }
+            continue;
+        }
+
+        if (type == tapi::kEnvelopeTypeError && topic == tapi::kTopicProtocolError) {
+            if (errorOut)
+                *errorOut = "Protocol error: " + jsonString(response, "message");
+            return false;
+        }
+
+        if (streamId.empty())
+            continue;
+
+        if (str::trimmed(jsonString(response, "streamId")) != streamId
+            || jsonString(response, "cmd") != "cmd.stream.start") {
+            continue;
+        }
+
+        if (type == tapi::kEnvelopeTypeEvent && topic == "stream.data") {
+            candidates.push_back(sanitizeDiscoveryCandidate(response));
+            continue;
+        }
+
+        if (type == tapi::kEnvelopeTypeEvent && topic == "stream.error") {
+            if (errorOut) {
+                const std::string err = responseErrorMessage(response);
+                *errorOut = err.empty() ? "Discovery stream failed" : err;
+            }
+            return false;
+        }
+
+        if (type == tapi::kEnvelopeTypeEvent && topic == "stream.end") {
+            if (candidatesOut)
+                *candidatesOut = candidates;
+            return true;
         }
     }
 
     if (errorOut)
-        *errorOut = QStringLiteral("Timeout waiting for discovery stream");
+        *errorOut = "Timeout waiting for discovery stream";
     return false;
 }
 
-bool parseInt(const QString &input, int *out)
+// ------------------------------------------------------------------ options
+
+bool parseInt(const std::string &input, int *out)
 {
     bool ok = false;
-    const int value = input.toInt(&ok);
+    const int value = str::toInt(input, &ok);
     if (!ok)
         return false;
     if (out)
@@ -479,49 +481,49 @@ enum class AdapterSelectorType {
 };
 
 struct CliOptions {
-    QString scope;
-    QString action;
-    QString tenant = QString::fromLatin1(kDefaultTenant);
-    QString socketPath = defaultSocketPathForTenant(QString::fromLatin1(kDefaultTenant));
+    std::string scope;
+    std::string action;
+    std::string tenant = kDefaultTenant;
+    std::string socketPath = defaultSocketPathForTenant(kDefaultTenant);
     bool socketPathExplicit = false;
     bool jsonOutput = false;
     bool all = false;
     AdapterSelectorType selectorType = AdapterSelectorType::None;
     int adapterId = 0;
-    QString selectorValue;
-    QString invokeActionId;
-    QString invokeParamsJson;
+    std::string selectorValue;
+    std::string invokeActionId;
+    std::string invokeParamsJson;
 };
 
-bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *errorOut)
+bool parseCliOptions(const std::vector<std::string> &args, CliOptions *optsOut, std::string *errorOut)
 {
     if (!optsOut)
         return false;
     if (args.size() < 2) {
         if (errorOut)
-            *errorOut = QStringLiteral("Invalid command");
+            *errorOut = "Invalid command";
         return false;
     }
 
     CliOptions opts;
-    QStringList positionalArgs;
-    QString positionalPluginType;
+    std::vector<std::string> positionalArgs;
+    std::string positionalPluginType;
     positionalArgs.reserve(args.size());
     positionalArgs.push_back(args.at(0));
 
-    for (int i = 1; i < args.size(); ++i) {
-        const QString arg = args.at(i);
-        if (arg == QStringLiteral("--tenant")) {
+    for (std::size_t i = 1; i < args.size(); ++i) {
+        const std::string &arg = args.at(i);
+        if (arg == "--tenant") {
             if (i + 1 >= args.size()) {
                 if (errorOut)
-                    *errorOut = QStringLiteral("Missing value for --tenant");
+                    *errorOut = "Missing value for --tenant";
                 return false;
             }
-            opts.tenant = args.at(++i).trimmed();
+            opts.tenant = str::trimmed(args.at(++i));
             continue;
         }
-        if (arg.startsWith(QStringLiteral("--tenant="))) {
-            opts.tenant = arg.mid(QStringLiteral("--tenant=").size()).trimmed();
+        if (arg.starts_with("--tenant=")) {
+            opts.tenant = str::trimmed(arg.substr(std::string_view("--tenant=").size()));
             continue;
         }
         positionalArgs.push_back(arg);
@@ -529,34 +531,34 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
 
     if (positionalArgs.size() < 2) {
         if (errorOut)
-            *errorOut = QStringLiteral("Invalid command");
+            *errorOut = "Invalid command";
         return false;
     }
 
-    if (positionalArgs.at(1) == QStringLiteral("discover")) {
-        opts.scope = QStringLiteral("discover");
-        opts.action = QStringLiteral("discover");
+    if (positionalArgs.at(1) == "discover") {
+        opts.scope = "discover";
+        opts.action = "discover";
     } else {
         if (positionalArgs.size() < 3) {
             if (errorOut)
-                *errorOut = QStringLiteral("Invalid command");
+                *errorOut = "Invalid command";
             return false;
         }
         opts.scope = positionalArgs.at(1);
         opts.action = positionalArgs.at(2);
     }
 
-    if (opts.scope == QStringLiteral("discover")) {
-        for (int i = 2; i < positionalArgs.size(); ++i) {
-            const QString arg = positionalArgs.at(i);
-            if (arg == QStringLiteral("--json")) {
+    if (opts.scope == "discover") {
+        for (std::size_t i = 2; i < positionalArgs.size(); ++i) {
+            const std::string &arg = positionalArgs.at(i);
+            if (arg == "--json") {
                 opts.jsonOutput = true;
                 continue;
             }
-            if (arg == QStringLiteral("--socket")) {
+            if (arg == "--socket") {
                 if (i + 1 >= positionalArgs.size()) {
                     if (errorOut)
-                        *errorOut = QStringLiteral("Missing value for --socket");
+                        *errorOut = "Missing value for --socket";
                     return false;
                 }
                 opts.socketPath = positionalArgs.at(++i);
@@ -564,13 +566,13 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
                 continue;
             }
             if (errorOut)
-                *errorOut = QStringLiteral("Unknown argument: %1").arg(arg);
+                *errorOut = "Unknown argument: " + arg;
             return false;
         }
 
         if (!isValidTenant(opts.tenant)) {
             if (errorOut)
-                *errorOut = QStringLiteral("Invalid tenant: %1").arg(opts.tenant);
+                *errorOut = "Invalid tenant: " + opts.tenant;
             return false;
         }
         if (!opts.socketPathExplicit)
@@ -580,64 +582,62 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
         return true;
     }
 
-    if (opts.scope != QStringLiteral("adapter") && opts.scope != QStringLiteral("transport")) {
+    if (opts.scope != "adapter" && opts.scope != "transport") {
         if (errorOut)
-            *errorOut = QStringLiteral("Unknown scope: %1").arg(opts.scope);
+            *errorOut = "Unknown scope: " + opts.scope;
         return false;
     }
 
-    if (opts.scope == QStringLiteral("transport")) {
-        if (opts.action != QStringLiteral("start")
-            && opts.action != QStringLiteral("stop")
-            && opts.action != QStringLiteral("restart")
-            && opts.action != QStringLiteral("reload")) {
+    if (opts.scope == "transport") {
+        if (opts.action != "start" && opts.action != "stop" && opts.action != "restart"
+            && opts.action != "reload") {
             if (errorOut)
-                *errorOut = QStringLiteral("Unknown action: %1").arg(opts.action);
+                *errorOut = "Unknown action: " + opts.action;
             return false;
         }
 
-        for (int i = 3; i < positionalArgs.size(); ++i) {
-            const QString arg = positionalArgs.at(i);
-            if (arg == QStringLiteral("--socket")) {
+        for (std::size_t i = 3; i < positionalArgs.size(); ++i) {
+            const std::string &arg = positionalArgs.at(i);
+            if (arg == "--socket") {
                 if (i + 1 >= positionalArgs.size()) {
                     if (errorOut)
-                        *errorOut = QStringLiteral("Missing value for --socket");
+                        *errorOut = "Missing value for --socket";
                     return false;
                 }
                 opts.socketPath = positionalArgs.at(++i);
                 opts.socketPathExplicit = true;
                 continue;
             }
-            if (!arg.startsWith(QLatin1Char('-')) && positionalPluginType.isEmpty()) {
+            if (!arg.starts_with("-") && positionalPluginType.empty()) {
                 positionalPluginType = arg;
                 continue;
             }
             if (errorOut)
-                *errorOut = QStringLiteral("Unknown argument: %1").arg(arg);
+                *errorOut = "Unknown argument: " + arg;
             return false;
         }
 
-        if (opts.selectorType == AdapterSelectorType::None && !positionalPluginType.isEmpty()) {
+        if (opts.selectorType == AdapterSelectorType::None && !positionalPluginType.empty()) {
             opts.selectorType = AdapterSelectorType::ByPluginType;
             opts.selectorValue = positionalPluginType;
         }
 
         if (!isValidTenant(opts.tenant)) {
             if (errorOut)
-                *errorOut = QStringLiteral("Invalid tenant: %1").arg(opts.tenant);
+                *errorOut = "Invalid tenant: " + opts.tenant;
             return false;
         }
         if (!opts.socketPathExplicit)
             opts.socketPath = defaultSocketPathForTenant(opts.tenant);
 
-        if (opts.selectorType != AdapterSelectorType::ByPluginType || opts.selectorValue.isEmpty()) {
+        if (opts.selectorType != AdapterSelectorType::ByPluginType || opts.selectorValue.empty()) {
             if (errorOut)
-                *errorOut = QStringLiteral("transport %1 requires <plugin>").arg(opts.action);
+                *errorOut = "transport " + opts.action + " requires <plugin>";
             return false;
         }
         if (opts.all || opts.jsonOutput) {
             if (errorOut)
-                *errorOut = QStringLiteral("transport commands do not support --all or --json");
+                *errorOut = "transport commands do not support --all or --json";
             return false;
         }
 
@@ -645,183 +645,177 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
         return true;
     }
 
-    if (opts.action != QStringLiteral("list")
-        && opts.action != QStringLiteral("discover")
-        && opts.action != QStringLiteral("start")
-        && opts.action != QStringLiteral("stop")
-        && opts.action != QStringLiteral("restart")
-        && opts.action != QStringLiteral("reload")
-        && opts.action != QStringLiteral("rescan")
-        && opts.action != QStringLiteral("invoke")) {
+    if (opts.action != "list" && opts.action != "discover" && opts.action != "start"
+        && opts.action != "stop" && opts.action != "restart" && opts.action != "reload"
+        && opts.action != "rescan" && opts.action != "invoke") {
         if (errorOut)
-            *errorOut = QStringLiteral("Unknown action: %1").arg(opts.action);
+            *errorOut = "Unknown action: " + opts.action;
         return false;
     }
 
-    for (int i = 3; i < positionalArgs.size(); ++i) {
-        const QString arg = positionalArgs.at(i);
-        if (arg == QStringLiteral("--json")) {
+    for (std::size_t i = 3; i < positionalArgs.size(); ++i) {
+        const std::string &arg = positionalArgs.at(i);
+        if (arg == "--json") {
             opts.jsonOutput = true;
             continue;
         }
-        if (arg == QStringLiteral("--all")) {
+        if (arg == "--all") {
             opts.all = true;
             continue;
         }
-        if (arg == QStringLiteral("--socket")) {
+        if (arg == "--socket") {
             if (i + 1 >= positionalArgs.size()) {
                 if (errorOut)
-                    *errorOut = QStringLiteral("Missing value for --socket");
+                    *errorOut = "Missing value for --socket";
                 return false;
             }
             opts.socketPath = positionalArgs.at(++i);
             opts.socketPathExplicit = true;
             continue;
         }
-        if (arg == QStringLiteral("--id")) {
+        if (arg == "--id") {
             if (i + 1 >= positionalArgs.size() || !parseInt(positionalArgs.at(i + 1), &opts.adapterId)) {
                 if (errorOut)
-                    *errorOut = QStringLiteral("Invalid value for --id");
+                    *errorOut = "Invalid value for --id";
                 return false;
             }
             opts.selectorType = AdapterSelectorType::ById;
             ++i;
             continue;
         }
-        if (arg == QStringLiteral("--external-id")) {
+        if (arg == "--external-id") {
             if (i + 1 >= positionalArgs.size()) {
                 if (errorOut)
-                    *errorOut = QStringLiteral("Missing value for --external-id");
+                    *errorOut = "Missing value for --external-id";
                 return false;
             }
             opts.selectorType = AdapterSelectorType::ByExternalId;
             opts.selectorValue = positionalArgs.at(++i);
             continue;
         }
-        if (arg == QStringLiteral("--name")) {
+        if (arg == "--name") {
             if (i + 1 >= positionalArgs.size()) {
                 if (errorOut)
-                    *errorOut = QStringLiteral("Missing value for --name");
+                    *errorOut = "Missing value for --name";
                 return false;
             }
             opts.selectorType = AdapterSelectorType::ByName;
             opts.selectorValue = positionalArgs.at(++i);
             continue;
         }
-        if (arg == QStringLiteral("--params")) {
+        if (arg == "--params") {
             if (i + 1 >= positionalArgs.size()) {
                 if (errorOut)
-                    *errorOut = QStringLiteral("Missing value for --params");
+                    *errorOut = "Missing value for --params";
                 return false;
             }
             opts.invokeParamsJson = positionalArgs.at(++i);
             continue;
         }
-        if (!arg.startsWith(QLatin1Char('-')) && positionalPluginType.isEmpty()) {
+        if (!arg.starts_with("-") && positionalPluginType.empty()) {
             positionalPluginType = arg;
             continue;
         }
         if (errorOut)
-            *errorOut = QStringLiteral("Unknown argument: %1").arg(arg);
+            *errorOut = "Unknown argument: " + arg;
         return false;
     }
 
-    if (opts.action == QStringLiteral("invoke")) {
+    if (opts.action == "invoke") {
         // For invoke the positional argument is the action id, not a plugin type.
-        opts.invokeActionId = positionalPluginType.trimmed();
+        opts.invokeActionId = str::trimmed(positionalPluginType);
         positionalPluginType.clear();
     }
 
-    if (opts.selectorType == AdapterSelectorType::None && !positionalPluginType.isEmpty()) {
+    if (opts.selectorType == AdapterSelectorType::None && !positionalPluginType.empty()) {
         opts.selectorType = AdapterSelectorType::ByPluginType;
         opts.selectorValue = positionalPluginType;
     }
 
-    if (opts.action == QStringLiteral("list")) {
+    if (opts.action == "list") {
         if (opts.selectorType != AdapterSelectorType::None || opts.all) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter list does not support selectors or --all");
+                *errorOut = "adapter list does not support selectors or --all";
             return false;
         }
-    } else if (opts.action == QStringLiteral("rescan")) {
+    } else if (opts.action == "rescan") {
         // Nothing to select. The whole point of it is that it takes no
         // argument: dpkg has just put something in the plugin directory and
         // core is being told to look, not told what to look for.
         if (opts.selectorType != AdapterSelectorType::None || opts.all) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter rescan does not support selectors or --all");
+                *errorOut = "adapter rescan does not support selectors or --all";
             return false;
         }
-    } else if (opts.action == QStringLiteral("discover")) {
+    } else if (opts.action == "discover") {
         if (opts.selectorType != AdapterSelectorType::None
             && opts.selectorType != AdapterSelectorType::ByPluginType) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter discover supports at most one optional <plugin> filter");
+                *errorOut = "adapter discover supports at most one optional <plugin> filter";
             return false;
         }
         if (opts.all) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter discover does not support --all");
+                *errorOut = "adapter discover does not support --all";
             return false;
         }
-    } else if (opts.action == QStringLiteral("reload")) {
-        if (opts.selectorType != AdapterSelectorType::ByPluginType || opts.selectorValue.isEmpty()) {
+    } else if (opts.action == "reload") {
+        if (opts.selectorType != AdapterSelectorType::ByPluginType || opts.selectorValue.empty()) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter reload requires <plugin>");
+                *errorOut = "adapter reload requires <plugin>";
             return false;
         }
         if (opts.all || opts.jsonOutput) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter reload does not support --all or --json");
+                *errorOut = "adapter reload does not support --all or --json";
             return false;
         }
-    } else if (opts.action == QStringLiteral("invoke")) {
-        if (opts.invokeActionId.isEmpty()) {
+    } else if (opts.action == "invoke") {
+        if (opts.invokeActionId.empty()) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter invoke requires <actionId>");
+                *errorOut = "adapter invoke requires <actionId>";
             return false;
         }
         if (opts.selectorType != AdapterSelectorType::ById
             && opts.selectorType != AdapterSelectorType::ByExternalId
             && opts.selectorType != AdapterSelectorType::ByName) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter invoke requires one selector (--id, --external-id, or --name)");
+                *errorOut = "adapter invoke requires one selector (--id, --external-id, or --name)";
             return false;
         }
         if (opts.all) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter invoke does not support --all");
+                *errorOut = "adapter invoke does not support --all";
             return false;
         }
     } else {
         if (opts.selectorType == AdapterSelectorType::None) {
             if (errorOut)
-                *errorOut = QStringLiteral("adapter %1 requires one selector (--id, --external-id, --name, or <plugin> with --all)")
-                                .arg(opts.action);
+                *errorOut = "adapter " + opts.action
+                    + " requires one selector (--id, --external-id, --name, or <plugin> with --all)";
             return false;
         }
         if (opts.selectorType == AdapterSelectorType::ByPluginType) {
             if (!opts.all) {
                 if (errorOut)
-                    *errorOut = QStringLiteral("<plugin> is only allowed with --all for adapter %1")
-                                    .arg(opts.action);
+                    *errorOut = "<plugin> is only allowed with --all for adapter " + opts.action;
                 return false;
             }
         } else if (opts.all) {
             if (errorOut)
-                *errorOut = QStringLiteral("--all is only supported with <plugin> for adapter %1").arg(opts.action);
+                *errorOut = "--all is only supported with <plugin> for adapter " + opts.action;
             return false;
         }
         if (opts.jsonOutput) {
             if (errorOut)
-                *errorOut = QStringLiteral("--json is only supported with adapter list or adapter discover");
+                *errorOut = "--json is only supported with adapter list or adapter discover";
             return false;
         }
     }
 
     if (!isValidTenant(opts.tenant)) {
         if (errorOut)
-            *errorOut = QStringLiteral("Invalid tenant: %1").arg(opts.tenant);
+            *errorOut = "Invalid tenant: " + opts.tenant;
         return false;
     }
     if (!opts.socketPathExplicit)
@@ -831,7 +825,9 @@ bool parseCliOptions(const QStringList &args, CliOptions *optsOut, QString *erro
     return true;
 }
 
-bool dropRootToPhi(QString *errorOut)
+// ------------------------------------------------------------------ identity
+
+bool dropRootToPhi(std::string *errorOut)
 {
     if (geteuid() != 0)
         return true;
@@ -839,98 +835,81 @@ bool dropRootToPhi(QString *errorOut)
     struct passwd *pw = getpwnam("phi");
     if (!pw) {
         if (errorOut)
-            *errorOut = QStringLiteral("User 'phi' not found; cannot drop root privileges");
+            *errorOut = "User 'phi' not found; cannot drop root privileges";
         return false;
     }
 
     if (setgid(pw->pw_gid) != 0) {
         if (errorOut)
-            *errorOut = QStringLiteral("Failed to drop group: %1").arg(QString::fromLocal8Bit(std::strerror(errno)));
+            *errorOut = std::string("Failed to drop group: ") + std::strerror(errno);
         return false;
     }
 
     if (setgroups(1, &pw->pw_gid) != 0) {
         if (errorOut)
-            *errorOut = QStringLiteral("Failed to reset supplementary groups: %1")
-                             .arg(QString::fromLocal8Bit(std::strerror(errno)));
+            *errorOut = std::string("Failed to reset supplementary groups: ") + std::strerror(errno);
         return false;
     }
 
     if (setuid(pw->pw_uid) != 0) {
         if (errorOut)
-            *errorOut = QStringLiteral("Failed to drop user: %1").arg(QString::fromLocal8Bit(std::strerror(errno)));
+            *errorOut = std::string("Failed to drop user: ") + std::strerror(errno);
         return false;
     }
 
     if (setuid(0) == 0) {
         if (errorOut)
-            *errorOut = QStringLiteral("Unexpectedly able to regain root privileges; aborting");
+            *errorOut = "Unexpectedly able to regain root privileges; aborting";
         return false;
     }
 
     return true;
 }
 
-QList<int> resolveAdapterIds(const CliOptions &opts, const QJsonArray &adapters, QString *errorOut)
+std::vector<int> resolveAdapterIds(const CliOptions &opts, const Json &adapters, std::string *errorOut)
 {
-    QList<int> ids;
+    std::vector<int> ids;
 
     if (opts.selectorType == AdapterSelectorType::ById) {
-        ids.append(opts.adapterId);
+        ids.push_back(opts.adapterId);
         return ids;
     }
 
-    auto readId = [](const QJsonObject &obj) -> int {
-        bool ok = false;
-        const int id = obj.value(QStringLiteral("id")).toVariant().toInt(&ok);
-        return ok ? id : -1;
+    const auto collectBy = [&](std::string_view key) {
+        for (const Json &entry : adapters) {
+            if (jsonString(entry, key) != opts.selectorValue)
+                continue;
+            const auto id = jsonInt(jsonValue(entry, "id"));
+            if (id.has_value() && *id > 0)
+                ids.push_back(*id);
+        }
     };
 
     if (opts.selectorType == AdapterSelectorType::ByExternalId) {
-        for (const QJsonValue &entry : adapters) {
-            const QJsonObject obj = entry.toObject();
-            if (obj.value(QStringLiteral("externalId")).toString() == opts.selectorValue) {
-                const int id = readId(obj);
-                if (id > 0)
-                    ids.append(id);
-            }
-        }
+        collectBy("externalId");
         if (ids.size() != 1 && errorOut) {
-            *errorOut = ids.isEmpty()
-                            ? QStringLiteral("No adapter found for externalId '%1'").arg(opts.selectorValue)
-                            : QStringLiteral("Multiple adapters found for externalId '%1'").arg(opts.selectorValue);
+            *errorOut = ids.empty()
+                ? "No adapter found for externalId '" + opts.selectorValue + "'"
+                : "Multiple adapters found for externalId '" + opts.selectorValue + "'";
         }
         return ids;
     }
 
     if (opts.selectorType == AdapterSelectorType::ByName) {
-        for (const QJsonValue &entry : adapters) {
-            const QJsonObject obj = entry.toObject();
-            if (obj.value(QStringLiteral("name")).toString() == opts.selectorValue) {
-                const int id = readId(obj);
-                if (id > 0)
-                    ids.append(id);
-            }
-        }
+        collectBy("name");
         if (ids.size() != 1 && errorOut) {
-            *errorOut = ids.isEmpty()
-                            ? QStringLiteral("No adapter found for name '%1'").arg(opts.selectorValue)
-                            : QStringLiteral("ambiguous_adapter_name: '%1' matches %2 adapters").arg(opts.selectorValue).arg(ids.size());
+            *errorOut = ids.empty()
+                ? "No adapter found for name '" + opts.selectorValue + "'"
+                : "ambiguous_adapter_name: '" + opts.selectorValue + "' matches "
+                      + str::number(ids.size()) + " adapters";
         }
         return ids;
     }
 
     if (opts.selectorType == AdapterSelectorType::ByPluginType) {
-        for (const QJsonValue &entry : adapters) {
-            const QJsonObject obj = entry.toObject();
-            if (obj.value(QStringLiteral("pluginType")).toString() == opts.selectorValue) {
-                const int id = readId(obj);
-                if (id > 0)
-                    ids.append(id);
-            }
-        }
-        if (ids.isEmpty() && errorOut)
-            *errorOut = QStringLiteral("No adapters found for pluginType '%1'").arg(opts.selectorValue);
+        collectBy("pluginType");
+        if (ids.empty() && errorOut)
+            *errorOut = "No adapters found for pluginType '" + opts.selectorValue + "'";
     }
 
     return ids;
@@ -940,221 +919,208 @@ QList<int> resolveAdapterIds(const CliOptions &opts, const QJsonArray &adapters,
 
 int main(int argc, char **argv)
 {
-    QCoreApplication app(argc, argv);
-
-    QString dropError;
+    std::string dropError;
     if (!dropRootToPhi(&dropError)) {
-        QTextStream(stderr) << dropError << "\n";
+        std::cerr << dropError << "\n";
         return 1;
     }
 
-    const QStringList args = app.arguments();
+    const std::vector<std::string> args(argv, argv + argc);
     CliOptions opts;
-    QString parseError;
+    std::string parseError;
     if (!parseCliOptions(args, &opts, &parseError)) {
-        if (!parseError.isEmpty())
-            QTextStream(stderr) << parseError << "\n";
+        if (!parseError.empty())
+            std::cerr << parseError << "\n";
         printUsage();
         return 2;
     }
 
-    if (opts.action == QStringLiteral("list")) {
-        QJsonArray adapters;
-        QString error;
+    if (opts.action == "list") {
+        Json adapters;
+        std::string error;
         if (!fetchAdapters(opts.socketPath, &adapters, &error)) {
-            QTextStream(stderr) << error << "\n";
+            std::cerr << error << "\n";
             return 1;
         }
         if (opts.jsonOutput)
-            QTextStream(stdout) << QString::fromUtf8(QJsonDocument(adapters).toJson(QJsonDocument::Indented));
+            std::cout << dumpIndented(adapters);
         else
             printAdapterTable(adapters);
         return 0;
     }
 
-    if (opts.scope == QStringLiteral("discover")) {
-        QJsonArray candidates;
-        QString error;
-        if (!runDiscoveryStream(opts.socketPath, QStringLiteral("network.discover"), {}, &candidates, &error)) {
-            QTextStream(stderr) << error << "\n";
+    if (opts.scope == "discover") {
+        Json candidates;
+        std::string error;
+        if (!runDiscoveryStream(opts.socketPath, "network.discover", {}, &candidates, &error)) {
+            std::cerr << error << "\n";
             return 1;
         }
         if (opts.jsonOutput)
-            QTextStream(stdout) << QString::fromUtf8(QJsonDocument(candidates).toJson(QJsonDocument::Indented));
+            std::cout << dumpIndented(candidates);
         else
             printDiscoveryTable(candidates);
         return 0;
     }
 
-    if (opts.action == QStringLiteral("discover")) {
-        QStringList pluginTypes;
-        if (opts.selectorType == AdapterSelectorType::ByPluginType && !opts.selectorValue.isEmpty())
+    if (opts.action == "discover") {
+        std::vector<std::string> pluginTypes;
+        if (opts.selectorType == AdapterSelectorType::ByPluginType && !opts.selectorValue.empty())
             pluginTypes.push_back(opts.selectorValue);
 
-        QJsonArray candidates;
-        QString error;
-        if (!runDiscoveryStream(opts.socketPath, QStringLiteral("adapter.discover"), pluginTypes, &candidates, &error)) {
-            QTextStream(stderr) << error << "\n";
+        Json candidates;
+        std::string error;
+        if (!runDiscoveryStream(opts.socketPath, "adapter.discover", pluginTypes, &candidates, &error)) {
+            std::cerr << error << "\n";
             return 1;
         }
         if (opts.jsonOutput)
-            QTextStream(stdout) << QString::fromUtf8(QJsonDocument(candidates).toJson(QJsonDocument::Indented));
+            std::cout << dumpIndented(candidates);
         else
             printDiscoveryTable(candidates);
         return 0;
     }
 
-    if (opts.scope == QStringLiteral("transport")) {
-        QJsonObject response;
-        QString error;
-        QJsonObject payload;
-        payload.insert(QStringLiteral("pluginType"), opts.selectorValue);
-        const QString topic = QStringLiteral("cmd.transport.%1").arg(opts.action);
-        if (!sendCommand(opts.socketPath, topic, payload, &response, &error)) {
-            QTextStream(stderr) << error << "\n";
+    if (opts.scope == "transport") {
+        Json payload = Json::object();
+        payload["pluginType"] = opts.selectorValue;
+        Json response;
+        std::string error;
+        if (!sendCommand(opts.socketPath, "cmd.transport." + opts.action, payload, &response, &error)) {
+            std::cerr << error << "\n";
             return 1;
         }
-        QTextStream(stdout) << "Transport " << opts.action << " completed for pluginType '"
-                            << opts.selectorValue << "'\n";
+        std::cout << "Transport " << opts.action << " completed for pluginType '"
+                  << opts.selectorValue << "'\n";
         return 0;
     }
 
-    if (opts.action == QStringLiteral("rescan")) {
-        QJsonObject response;
-        QString error;
-        if (!sendCommand(opts.socketPath, QStringLiteral("cmd.adapter.plugins.rescan"), {},
+    if (opts.action == "rescan") {
+        Json response;
+        std::string error;
+        if (!sendCommand(opts.socketPath, "cmd.adapter.plugins.rescan", Json::object(),
                          &response, &error)) {
-            QTextStream(stderr) << error << "\n";
+            std::cerr << error << "\n";
             return 1;
         }
-        const QJsonArray factories = response.value(QStringLiteral("factories")).toArray();
-        QTextStream(stdout) << "Plugin directories read again: " << factories.size()
-                            << " adapter types available\n";
+        std::cout << "Plugin directories read again: " << jsonArray(response, "factories").size()
+                  << " adapter types available\n";
         return 0;
     }
 
-    if (opts.action == QStringLiteral("reload")) {
-        QJsonObject response;
-        QString error;
-        QJsonObject payload;
-        payload.insert(QStringLiteral("pluginType"), opts.selectorValue);
-        if (!sendCommand(opts.socketPath, QStringLiteral("cmd.adapter.reload"), payload, &response, &error)) {
-            QTextStream(stderr) << error << "\n";
+    if (opts.action == "reload") {
+        Json payload = Json::object();
+        payload["pluginType"] = opts.selectorValue;
+        Json response;
+        std::string error;
+        if (!sendCommand(opts.socketPath, "cmd.adapter.reload", payload, &response, &error)) {
+            std::cerr << error << "\n";
             return 1;
         }
-        QTextStream(stdout) << "Reload triggered for pluginType '" << opts.selectorValue << "'\n";
+        std::cout << "Reload triggered for pluginType '" << opts.selectorValue << "'\n";
         return 0;
     }
 
-    if (opts.action == QStringLiteral("invoke")) {
-        QJsonObject params;
-        if (!opts.invokeParamsJson.trimmed().isEmpty()) {
-            QJsonParseError parseError;
-            const QJsonDocument doc = QJsonDocument::fromJson(opts.invokeParamsJson.toUtf8(), &parseError);
-            if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
-                QTextStream(stderr) << "Invalid --params: expected a JSON object\n";
+    if (opts.action == "invoke") {
+        Json params = Json::object();
+        if (!str::trimmed(opts.invokeParamsJson).empty()) {
+            const Json parsed = parseJson(opts.invokeParamsJson);
+            if (!parsed.is_object()) {
+                std::cerr << "Invalid --params: expected a JSON object\n";
                 return 2;
             }
-            params = doc.object();
+            params = parsed;
         }
 
-        QJsonArray adapters;
-        QString listError;
+        Json adapters;
+        std::string listError;
         if (!fetchAdapters(opts.socketPath, &adapters, &listError)) {
-            QTextStream(stderr) << listError << "\n";
+            std::cerr << listError << "\n";
             return 1;
         }
-        QString resolveError;
-        const QList<int> ids = resolveAdapterIds(opts, adapters, &resolveError);
-        if (!resolveError.isEmpty()) {
-            QTextStream(stderr) << resolveError << "\n";
+        std::string resolveError;
+        const std::vector<int> ids = resolveAdapterIds(opts, adapters, &resolveError);
+        if (!resolveError.empty()) {
+            std::cerr << resolveError << "\n";
             return 1;
         }
         if (ids.size() != 1) {
-            QTextStream(stderr) << "adapter invoke requires exactly one matching adapter (matched "
-                                << ids.size() << ")\n";
+            std::cerr << "adapter invoke requires exactly one matching adapter (matched "
+                      << ids.size() << ")\n";
             return 1;
         }
 
-        QJsonObject payload;
-        payload.insert(QStringLiteral("scope"), QStringLiteral("instance"));
-        payload.insert(QStringLiteral("adapterId"), ids.first());
-        payload.insert(QStringLiteral("actionId"), opts.invokeActionId);
-        payload.insert(QStringLiteral("params"), params);
+        Json payload = Json::object();
+        payload["scope"] = "instance";
+        payload["adapterId"] = ids.front();
+        payload["actionId"] = opts.invokeActionId;
+        payload["params"] = params;
 
-        QJsonObject response;
-        QString error;
-        if (!sendCommand(opts.socketPath, QStringLiteral("cmd.adapter.action.invoke"), payload,
-                         &response, &error)) {
-            QTextStream(stderr) << error << "\n";
+        Json response;
+        std::string error;
+        if (!sendCommand(opts.socketPath, "cmd.adapter.action.invoke", payload, &response, &error)) {
+            std::cerr << error << "\n";
             return 1;
         }
 
-        const int status = response.value(QStringLiteral("status")).toInt(-1);
+        const int status = jsonInt(jsonValue(response, "status")).value_or(-1);
         if (opts.jsonOutput) {
-            QTextStream(stdout) << QString::fromUtf8(QJsonDocument(response).toJson(QJsonDocument::Indented));
+            std::cout << dumpIndented(response);
         } else {
-            QTextStream out(stdout);
-            out << "status: " << response.value(QStringLiteral("statusName")).toString(QStringLiteral("unknown"))
-                << " (" << status << ")\n";
-            const QJsonValue resultValue = response.value(QStringLiteral("resultValue"));
-            if (!resultValue.isUndefined() && !resultValue.isNull()) {
-                if (resultValue.isObject() || resultValue.isArray()) {
-                    const QJsonDocument doc = resultValue.isObject()
-                        ? QJsonDocument(resultValue.toObject())
-                        : QJsonDocument(resultValue.toArray());
-                    out << "result: " << QString::fromUtf8(doc.toJson(QJsonDocument::Compact)) << "\n";
-                } else {
-                    out << "result: " << resultValue.toVariant().toString() << "\n";
-                }
+            const std::string statusName = jsonString(response, "statusName");
+            std::cout << "status: " << (statusName.empty() ? "unknown" : statusName)
+                      << " (" << status << ")\n";
+            const Json resultValue = jsonValue(response, "resultValue");
+            if (!resultValue.is_null()) {
+                if (resultValue.is_object() || resultValue.is_array())
+                    std::cout << "result: " << dumpCompact(resultValue) << "\n";
+                else
+                    std::cout << "result: " << scalarText(resultValue) << "\n";
             }
-            const QJsonValue errorValue = response.value(QStringLiteral("error"));
-            if (errorValue.isObject()) {
-                out << "error: "
-                    << errorValue.toObject().value(QStringLiteral("message")).toString() << "\n";
-            }
+            const Json errorValue = jsonValue(response, "error");
+            if (errorValue.is_object())
+                std::cout << "error: " << jsonString(errorValue, "message") << "\n";
         }
         return status == 0 ? 0 : 1;
     }
 
-    QJsonArray adapters;
-    QString listError;
+    Json adapters;
+    std::string listError;
     if (!fetchAdapters(opts.socketPath, &adapters, &listError)) {
-        QTextStream(stderr) << listError << "\n";
+        std::cerr << listError << "\n";
         return 1;
     }
 
-    QString resolveError;
-    const QList<int> ids = resolveAdapterIds(opts, adapters, &resolveError);
-    if (!resolveError.isEmpty()) {
-        QTextStream(stderr) << resolveError << "\n";
+    std::string resolveError;
+    const std::vector<int> ids = resolveAdapterIds(opts, adapters, &resolveError);
+    if (!resolveError.empty()) {
+        std::cerr << resolveError << "\n";
         return 1;
     }
-    if (ids.isEmpty()) {
-        QTextStream(stderr) << "No adapter ids resolved\n";
+    if (ids.empty()) {
+        std::cerr << "No adapter ids resolved\n";
         return 1;
     }
 
-    const QString topic = QStringLiteral("cmd.adapter.%1").arg(opts.action);
+    const std::string topic = "cmd.adapter." + opts.action;
     int okCount = 0;
     int failCount = 0;
-    QStringList failures;
+    std::vector<std::string> failures;
     for (const int id : ids) {
-        QJsonObject cmdPayload;
-        cmdPayload.insert(QStringLiteral("adapterId"), id);
-        QJsonObject response;
-        QString error;
-        if (sendCommand(opts.socketPath, topic, cmdPayload, &response, &error)) {
+        Json payload = Json::object();
+        payload["adapterId"] = id;
+        Json response;
+        std::string error;
+        if (sendCommand(opts.socketPath, topic, payload, &response, &error)) {
             ++okCount;
         } else {
             ++failCount;
-            failures.push_back(QStringLiteral("adapterId=%1: %2").arg(id).arg(error));
+            failures.push_back("adapterId=" + str::number(id) + ": " + error);
         }
     }
 
-    QTextStream out(stdout);
-    out << opts.action << " completed: ok=" << okCount << " failed=" << failCount << "\n";
-    for (const QString &failure : failures)
-        QTextStream(stderr) << failure << "\n";
+    std::cout << opts.action << " completed: ok=" << okCount << " failed=" << failCount << "\n";
+    for (const std::string &failure : failures)
+        std::cerr << failure << "\n";
     return failCount == 0 ? 0 : 1;
 }

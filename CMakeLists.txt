@@ -8,13 +8,12 @@ project(phi-transport-cli
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_AUTOMOC ON)
 
 include(GNUInstallDirs)
 
-# Qt remains for the phi-cli client binary only; the plugin itself runs on
-# the runtime loop (contract 2.0.0) and is Qt-free.
-find_package(Qt6 REQUIRED COMPONENTS Core Network)
+# No Qt. The plugin runs on the runtime loop (contract 2.0.0) and phi-cli is a
+# blocking client: nlohmann for JSON, the transport api for the envelope rules
+# both sides of the wire have to agree on, and poll() for the waiting.
 find_package(nlohmann_json REQUIRED)
 find_package(phi-transport-api 2.1.0 CONFIG QUIET)
 
@@ -52,12 +51,14 @@ set_target_properties(phi_transport_cli PROPERTIES
 
 add_executable(phi-cli
     src/phi_cli_main.cpp
+    src/cli_socket.cpp
+    src/cli_socket.h
 )
 
 target_link_libraries(phi-cli
     PRIVATE
-        Qt6::Core
-        Qt6::Network
+        nlohmann_json::nlohmann_json
+        ${PHI_TRANSPORT_API_TARGET}
 )
 
 install(TARGETS phi_transport_cli

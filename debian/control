@@ -6,7 +6,6 @@ Build-Depends:
  debhelper-compat (= 13),
  cmake,
  ninja-build,
- qt6-base-dev,
  nlohmann-json3-dev,
  libphi-runtime-dev,
  phi-transport-api-dev (>= 2.1.0)
