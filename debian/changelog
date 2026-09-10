@@ -1,3 +1,9 @@
+phi-transport-cli (0.0~git202609101658.1e84f2b-1) trixie; urgency=medium
+
+  * Snapshot build.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Thu, 10 Sep 2026 16:58:10 +0200
+
 phi-transport-cli (0.0~git202609101418.994e162-1) trixie; urgency=medium
 
   * `phi-cli backend intents` prints cmd.host.intents.list: what each
