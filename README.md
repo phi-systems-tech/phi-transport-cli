@@ -51,7 +51,7 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 - Local CLI client (`phi-cli`) with adapter list/start/stop/restart/reload
 - Local CLI client (`phi-cli`) with transport start/stop/restart/reload
 - Local CLI client (`phi-cli`) with radio list/probe/claim/release and backend
-  list/create/remove/start/stop/restart
+  list/intents/create/remove/start/stop/restart
 
 ### Bringing up a coordinator without a browser
 
@@ -66,6 +66,11 @@ phi-cli radio probe usb-1a86:7523@1-4-if00   # ask a port that cannot say what i
 phi-cli backend list                      # what is bound, and which kinds exist
 phi-cli backend create --kind zigbee2mqtt --id study --resource usb-1a86:7523@1-4-if00
 ```
+
+On an appliance nobody types any of that: a rule under `/usr/share/phi/intents`
+asks for a backend and the daemon creates it at boot. `phi-cli backend intents`
+shows what those rules asked for and what became of each one, which is otherwise
+visible only as a backend that appears or a line in the journal.
 
 Two things the host layer decides rather than this client:
 

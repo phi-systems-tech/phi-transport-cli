@@ -192,6 +192,7 @@ void printUsage()
         << "  phi-cli radio claim <resource> --claimant <name> [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli radio release <resource> [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backend list [--tenant <tenant>] [--socket <path>] [--json]\n"
+        << "  phi-cli backend intents [--tenant <tenant>] [--socket <path>] [--json]\n"
         << "  phi-cli backend create --kind <kind> --id <name> --resource <resource> [--json] [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backend remove <backend> [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backend start|stop|restart <backend> [--tenant <tenant>] [--socket <path>]\n";
@@ -277,6 +278,38 @@ void printBackendTable(const Json &backends)
                   << cell(boolText(jsonBool(entry, "installed")), 11)
                   << cell(jsonString(entry, "state"), 12)
                   << jsonString(entry, "resourceId") << "\n";
+    }
+}
+
+/// What the packages on this box asked for, and what became of it.
+///
+/// A rule - a file that asks for one backend per coordinator rather than for a
+/// named one - is printed as the rows it means right now, one per stick it
+/// would take. A rule that means nothing at the moment keeps a row of its own
+/// under the name `kind@*`, because "this box wants one per stick and no stick
+/// suits" is the answer somebody is looking for and an empty list does not
+/// give it.
+void printIntentTable(const Json &intents)
+{
+    std::cout << cell("STATE", 12) << cell("BACKEND", 24) << cell("TENANT", 8)
+              << cell("RESOURCE", 34) << "SOURCE" << "\n";
+
+    for (const Json &entry : intents) {
+        const std::string backend = jsonString(entry, "backend");
+        const std::string shown = !backend.empty()
+            ? backend
+            : jsonString(entry, "kind") + (jsonBool(entry, "rule") ? "@*" : "@?");
+
+        std::cout << cell(jsonString(entry, "state"), 12) << cell(shown, 24)
+                  << cell(jsonString(entry, "tenant"), 8)
+                  << cell(jsonString(entry, "resourceId"), 34)
+                  << jsonString(entry, "source") << "\n";
+
+        // Under its row rather than in a column: a note is a sentence, and a
+        // sentence in a table pushes everything after it off the screen.
+        const std::string note = jsonString(entry, "note");
+        if (!note.empty())
+            std::cout << "  " << note << "\n";
     }
 }
 
@@ -715,19 +748,22 @@ bool parseHostScope(const std::vector<std::string> &positionalArgs, CliOptions *
         return true;
     }
 
-    if (opts->action != "list" && opts->action != "create" && opts->action != "remove"
-        && opts->action != "start" && opts->action != "stop" && opts->action != "restart") {
+    if (opts->action != "list" && opts->action != "intents" && opts->action != "create"
+        && opts->action != "remove" && opts->action != "start" && opts->action != "stop"
+        && opts->action != "restart") {
         return refuse("Unknown action: " + opts->action);
     }
     if (!opts->claimant.empty())
         return refuse("--claimant is only supported with radio claim");
-    if (opts->jsonOutput && opts->action != "list" && opts->action != "create")
-        return refuse("--json is only supported with backend list or backend create");
+    if (opts->jsonOutput && opts->action != "list" && opts->action != "intents"
+        && opts->action != "create") {
+        return refuse("--json is only supported with backend list, backend intents or backend create");
+    }
 
-    if (opts->action == "list") {
+    if (opts->action == "list" || opts->action == "intents") {
         if (!positional.empty() || !opts->backendKind.empty() || !opts->backendId.empty()
             || !opts->resourceId.empty()) {
-            return refuse("backend list takes no argument");
+            return refuse("backend " + opts->action + " takes no argument");
         }
         return true;
     }
@@ -1294,6 +1330,27 @@ int main(int argc, char **argv)
             }
             printBackendTable(jsonArray(response, "backends"));
             printBackendKinds(jsonArray(response, "kinds"));
+            return 0;
+        }
+
+        if (opts.action == "intents") {
+            Json response;
+            std::string error;
+            if (!sendCommand(opts.socketPath, "cmd.host.intents.list", Json::object(),
+                             &response, &error)) {
+                std::cerr << error << "\n";
+                return 1;
+            }
+            const Json intents = jsonArray(response, "intents");
+            if (opts.jsonOutput) {
+                std::cout << dumpIndented(intents);
+                return 0;
+            }
+            if (intents.empty()) {
+                std::cout << "No package on this host asked for a backend.\n";
+                return 0;
+            }
+            printIntentTable(intents);
             return 0;
         }
 
