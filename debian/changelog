@@ -1,3 +1,13 @@
+phi-transport-cli (0.0~git202609101418.994e162-1) trixie; urgency=medium
+
+  * `phi-cli backend intents` prints cmd.host.intents.list: what each
+    rule under /usr/share/phi/intents asked for and what became of
+    it. A rule that means nothing right now prints under the name
+    kind@*, because an empty table would read as "no package asked
+    for anything".
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Thu, 10 Sep 2026 14:18:01 +0200
+
 phi-transport-cli (0.0~git202609101408.7f1ad7c-1) trixie; urgency=medium
 
   * phi-cli speaks the host layer: radio list/probe/claim/release and
