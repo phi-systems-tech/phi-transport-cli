@@ -266,16 +266,24 @@ void printRadioTable(const Json &radios)
     }
 }
 
+/// One row per backend, with what is meant to happen beside what is happening.
+///
+/// The two columns are not the same question and reading only the second gets
+/// it wrong: a backend somebody stopped, one whose radio has been gone long
+/// enough that the host layer stopped expecting it, and one whose runtime keeps
+/// crashing are three different situations that systemd calls `inactive`.
 void printBackendTable(const Json &backends)
 {
     std::cout << cell("NAME", 24) << cell("KIND", 16) << cell("TENANT", 8)
-              << cell("INSTALLED", 11) << cell("STATE", 12) << "RESOURCE" << "\n";
+              << cell("INSTALLED", 11) << cell("EXPECTED", 10) << cell("STATE", 12)
+              << "RESOURCE" << "\n";
 
     for (const Json &entry : backends) {
         std::cout << cell(jsonString(entry, "name"), 24)
                   << cell(jsonString(entry, "kind"), 16)
                   << cell(jsonString(entry, "tenant"), 8)
                   << cell(boolText(jsonBool(entry, "installed")), 11)
+                  << cell(boolText(jsonBool(entry, "shouldRun")), 10)
                   << cell(jsonString(entry, "state"), 12)
                   << jsonString(entry, "resourceId") << "\n";
     }
