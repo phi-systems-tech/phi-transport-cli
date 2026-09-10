@@ -1,3 +1,16 @@
+phi-transport-cli (0.0~git202609101408.7f1ad7c-1) trixie; urgency=medium
+
+  * phi-cli speaks the host layer: radio list/probe/claim/release and
+    backend list/create/remove/start/stop/restart, driving
+    cmd.host.radio.* and cmd.host.backend* from a terminal instead of
+    only the settings page's WebSocket-by-hand path.
+  * Fixes a refusal that read as a success: a command core declines
+    comes back as accepted:false rather than a rejected ack, and
+    sendCommand only read the ack, so every cmd.* this client sends
+    could misreport why it failed.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Thu, 10 Sep 2026 14:08:12 +0200
+
 phi-transport-cli (0.0~git202609090827.1cb100d-1) trixie; urgency=medium
 
   * phi-cli is Qt-free, which takes the last Qt6 binary out of this repo: the
