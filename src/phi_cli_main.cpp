@@ -186,7 +186,15 @@ void printUsage()
         << "  phi-cli adapter reload <plugin> [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli adapter rescan [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli adapter invoke <actionId> (--id <id> | --external-id <id> | --name <name>) [--params <json>] [--json] [--tenant <tenant>] [--socket <path>]\n"
-        << "  phi-cli transport start|stop|restart|reload <plugin> [--tenant <tenant>] [--socket <path>]\n";
+        << "  phi-cli transport start|stop|restart|reload <plugin> [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli radio list [--tenant <tenant>] [--socket <path>] [--json]\n"
+        << "  phi-cli radio probe <resource> [--tenant <tenant>] [--socket <path>] [--json]\n"
+        << "  phi-cli radio claim <resource> --claimant <name> [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli radio release <resource> [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backend list [--tenant <tenant>] [--socket <path>] [--json]\n"
+        << "  phi-cli backend create --kind <kind> --id <name> --resource <resource> [--json] [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backend remove <backend> [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backend start|stop|restart <backend> [--tenant <tenant>] [--socket <path>]\n";
 }
 
 std::string boolText(bool value)
@@ -226,6 +234,68 @@ void printDiscoveryTable(const Json &candidates)
                   << cell(jsonString(entry, "ip"), 18)
                   << cell(scalarText(jsonValue(entry, "port")), 8)
                   << cell(jsonString(entry, "service"), 12) << "\n";
+    }
+}
+
+/// One row per port the host layer is reporting, claimed or not.
+///
+/// The resource id comes first because it is the argument every other radio
+/// command takes, and the device path comes last because it is the only column
+/// that regularly runs over its width - a `by-id` link is longer than anything
+/// worth aligning the rest of the table to.
+void printRadioTable(const Json &radios)
+{
+    std::cout << cell("RESOURCE", 34) << cell("STATE", 12) << cell("FAMILY", 12)
+              << cell("IDENTIFIED", 14) << cell("CLAIMANT", 20) << "DEVICE" << "\n";
+
+    for (const Json &entry : radios) {
+        // A port somebody else holds arrives as an id and a state and nothing
+        // else. The empty cells are the honest rendering of that: the row is
+        // there because the port is there, and the rest is not ours to read.
+        const Json claim = jsonObject(entry, "claim");
+        const std::string device = jsonString(entry, "devicePath").empty()
+            ? jsonString(entry, "nodePath")
+            : jsonString(entry, "devicePath");
+
+        std::cout << cell(jsonString(entry, "id"), 34)
+                  << cell(jsonString(entry, "state"), 12)
+                  << cell(jsonString(entry, "radioFamily"), 12)
+                  << cell(jsonString(entry, "identification"), 14)
+                  << cell(jsonString(claim, "claimant"), 20) << device << "\n";
+    }
+}
+
+void printBackendTable(const Json &backends)
+{
+    std::cout << cell("NAME", 24) << cell("KIND", 16) << cell("TENANT", 8)
+              << cell("INSTALLED", 11) << cell("STATE", 12) << "RESOURCE" << "\n";
+
+    for (const Json &entry : backends) {
+        std::cout << cell(jsonString(entry, "name"), 24)
+                  << cell(jsonString(entry, "kind"), 16)
+                  << cell(jsonString(entry, "tenant"), 8)
+                  << cell(boolText(jsonBool(entry, "installed")), 11)
+                  << cell(jsonString(entry, "state"), 12)
+                  << jsonString(entry, "resourceId") << "\n";
+    }
+}
+
+/// The backend kinds this host has a runtime for, printed under the table.
+///
+/// Without it `backend create --kind` is a guess: the kinds come from whatever
+/// descriptors are installed in `/usr/share/phi/backends`, so the only way to
+/// know what this box will accept is to ask this box.
+void printBackendKinds(const Json &kinds)
+{
+    if (kinds.empty()) {
+        std::cout << "\nNo backend kinds are installed on this host.\n";
+        return;
+    }
+
+    std::cout << "\nInstalled kinds:\n";
+    for (const Json &entry : kinds) {
+        const std::string displayName = jsonString(entry, "displayName");
+        std::cout << "  " << cell(jsonString(entry, "kind"), 18) << displayName << "\n";
     }
 }
 
@@ -314,6 +384,23 @@ bool sendCommand(const std::string &socketPath,
         }
 
         if (type == tapi::kEnvelopeTypeResponse && responseTopic == tapi::kTopicCmdResponse) {
+            // A command core refused comes back here, not in the ack: the ack
+            // says the transport took the frame, and the answer says what core
+            // did with it. `accepted` is only ever written on a rejection
+            // (`makeSyncRejectionPayload`), so its absence is a success and
+            // reading it is not a second opinion about one.
+            //
+            // Without this a refusal printed a success line with every field
+            // empty - "usb-1a86:7523@1-4-if00: answered nothing this host
+            // recognises" for a port the host had just declined to touch.
+            const Json accepted = jsonValue(response, "accepted");
+            if (accepted.is_boolean() && !accepted.get<bool>()) {
+                if (errorOut) {
+                    const std::string err = responseErrorMessage(response);
+                    *errorOut = err.empty() ? std::string("Command refused") : err;
+                }
+                return false;
+            }
             if (responsePayload)
                 *responsePayload = response;
             return true;
@@ -411,6 +498,16 @@ bool runDiscoveryStream(const std::string &socketPath,
         }
 
         if (type == tapi::kEnvelopeTypeResponse && topic == tapi::kTopicCmdResponse && cidMatches) {
+            // The same rule the plain commands follow: a refusal arrives as the
+            // answer, and saying why beats "no streamId".
+            const Json accepted = jsonValue(response, "accepted");
+            if (accepted.is_boolean() && !accepted.get<bool>()) {
+                if (errorOut) {
+                    const std::string err = responseErrorMessage(response);
+                    *errorOut = err.empty() ? std::string("Discovery refused") : err;
+                }
+                return false;
+            }
             streamId = str::trimmed(jsonString(response, "streamId"));
             if (streamId.empty()) {
                 if (errorOut)
@@ -493,7 +590,177 @@ struct CliOptions {
     std::string selectorValue;
     std::string invokeActionId;
     std::string invokeParamsJson;
+    // The host layer's arguments. A resource id is what the inventory calls one
+    // port, a claimant is who wants to hold it, and a backend is named by its
+    // kind and the instance id the operator chose.
+    std::string resourceId;
+    std::string claimant;
+    std::string backendKind;
+    std::string backendId;
 };
+
+/// `kind@id` back into its two halves - the shape `backendName()` composes on
+/// the host side, and the only name a backend is ever printed under.
+///
+/// Split at the first `@` rather than the last: an instance id may not contain
+/// one (the host layer refuses anything but letters, digits, hyphens and
+/// underscores), so the first is the only one, and a name with a second `@` in
+/// it is one this host never wrote.
+bool splitBackendName(const std::string &name, std::string *kind, std::string *id)
+{
+    const std::size_t at = name.find('@');
+    if (at == std::string::npos || at == 0 || at + 1 >= name.size())
+        return false;
+    if (kind)
+        *kind = name.substr(0, at);
+    if (id)
+        *id = name.substr(at + 1);
+    return true;
+}
+
+/// The host layer's own arguments: `radio ...` and `backend ...`.
+///
+/// Parsed apart from the adapter scope because nothing is shared with it. An
+/// adapter is picked out of a list this core keeps, by id or name or plugin
+/// type; a port and a backend are named outright, with the id the host layer
+/// printed in the table above.
+bool parseHostScope(const std::vector<std::string> &positionalArgs, CliOptions *opts,
+                    std::string *errorOut)
+{
+    const bool isRadio = opts->scope == "radio";
+    std::string positional;
+    std::size_t i = 3;
+
+    const auto takeValue = [&](std::string *out) {
+        if (i + 1 >= positionalArgs.size())
+            return false;
+        *out = str::trimmed(positionalArgs.at(++i));
+        return true;
+    };
+    const auto missing = [&](const char *option) {
+        if (errorOut)
+            *errorOut = std::string("Missing value for ") + option;
+        return false;
+    };
+
+    for (; i < positionalArgs.size(); ++i) {
+        const std::string &arg = positionalArgs.at(i);
+        if (arg == "--json") {
+            opts->jsonOutput = true;
+            continue;
+        }
+        if (arg == "--socket") {
+            if (!takeValue(&opts->socketPath))
+                return missing("--socket");
+            opts->socketPathExplicit = true;
+            continue;
+        }
+        if (arg == "--claimant") {
+            if (!takeValue(&opts->claimant))
+                return missing("--claimant");
+            continue;
+        }
+        if (arg == "--kind") {
+            if (!takeValue(&opts->backendKind))
+                return missing("--kind");
+            continue;
+        }
+        if (arg == "--id") {
+            if (!takeValue(&opts->backendId))
+                return missing("--id");
+            continue;
+        }
+        if (arg == "--resource") {
+            if (!takeValue(&opts->resourceId))
+                return missing("--resource");
+            continue;
+        }
+        if (!arg.starts_with("-") && positional.empty()) {
+            positional = str::trimmed(arg);
+            continue;
+        }
+        if (errorOut)
+            *errorOut = "Unknown argument: " + arg;
+        return false;
+    }
+
+    const auto refuse = [&](const std::string &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+
+    if (isRadio) {
+        if (opts->action != "list" && opts->action != "probe" && opts->action != "claim"
+            && opts->action != "release") {
+            return refuse("Unknown action: " + opts->action);
+        }
+        if (!opts->backendKind.empty() || !opts->backendId.empty() || !opts->resourceId.empty())
+            return refuse("radio " + opts->action + " takes <resource> rather than an option");
+        if (opts->action != "claim" && !opts->claimant.empty())
+            return refuse("--claimant is only supported with radio claim");
+        if (opts->jsonOutput && opts->action != "list" && opts->action != "probe")
+            return refuse("--json is only supported with radio list or radio probe");
+
+        if (opts->action == "list") {
+            if (!positional.empty())
+                return refuse("radio list takes no argument");
+            return true;
+        }
+        if (positional.empty())
+            return refuse("radio " + opts->action + " requires <resource>");
+        opts->resourceId = positional;
+        if (opts->action == "claim" && opts->claimant.empty())
+            return refuse("radio claim requires --claimant");
+        return true;
+    }
+
+    if (opts->action != "list" && opts->action != "create" && opts->action != "remove"
+        && opts->action != "start" && opts->action != "stop" && opts->action != "restart") {
+        return refuse("Unknown action: " + opts->action);
+    }
+    if (!opts->claimant.empty())
+        return refuse("--claimant is only supported with radio claim");
+    if (opts->jsonOutput && opts->action != "list" && opts->action != "create")
+        return refuse("--json is only supported with backend list or backend create");
+
+    if (opts->action == "list") {
+        if (!positional.empty() || !opts->backendKind.empty() || !opts->backendId.empty()
+            || !opts->resourceId.empty()) {
+            return refuse("backend list takes no argument");
+        }
+        return true;
+    }
+
+    if (opts->action == "create") {
+        if (!positional.empty())
+            return refuse("backend create names its backend with --kind and --id");
+        if (opts->backendKind.empty())
+            return refuse("backend create requires --kind");
+        if (opts->backendId.empty())
+            return refuse("backend create requires --id");
+        // Named rather than guessed. The host layer picks a port by itself only
+        // where a rule under /usr/share/phi/intents asked it to, and a person
+        // at a terminal is not that rule: creating a backend claims a piece of
+        // hardware, and which one is the operator's sentence to write.
+        if (opts->resourceId.empty())
+            return refuse("backend create requires --resource, the id from radio list");
+        return true;
+    }
+
+    if (!opts->resourceId.empty())
+        return refuse("backend " + opts->action + " does not take --resource");
+    if (positional.empty()) {
+        if (opts->backendKind.empty() || opts->backendId.empty())
+            return refuse("backend " + opts->action + " requires <backend>, the name from backend list");
+        return true;
+    }
+    if (!opts->backendKind.empty() || !opts->backendId.empty())
+        return refuse("backend " + opts->action + " takes <backend> or --kind with --id, not both");
+    if (!splitBackendName(positional, &opts->backendKind, &opts->backendId))
+        return refuse("'" + positional + "' is not a backend name; they read as kind@name");
+    return true;
+}
 
 bool parseCliOptions(const std::vector<std::string> &args, CliOptions *optsOut, std::string *errorOut)
 {
@@ -569,6 +836,22 @@ bool parseCliOptions(const std::vector<std::string> &args, CliOptions *optsOut, 
                 *errorOut = "Unknown argument: " + arg;
             return false;
         }
+
+        if (!isValidTenant(opts.tenant)) {
+            if (errorOut)
+                *errorOut = "Invalid tenant: " + opts.tenant;
+            return false;
+        }
+        if (!opts.socketPathExplicit)
+            opts.socketPath = defaultSocketPathForTenant(opts.tenant);
+
+        *optsOut = opts;
+        return true;
+    }
+
+    if (opts.scope == "radio" || opts.scope == "backend") {
+        if (!parseHostScope(positionalArgs, &opts, errorOut))
+            return false;
 
         if (!isValidTenant(opts.tenant)) {
             if (errorOut)
@@ -933,6 +1216,153 @@ int main(int argc, char **argv)
             std::cerr << parseError << "\n";
         printUsage();
         return 2;
+    }
+
+    // The host layer first, because `list` means one thing under `radio` and
+    // `backend` and another under `adapter`, and the adapter branch below reads
+    // the action without its scope.
+    if (opts.scope == "radio") {
+        if (opts.action == "list") {
+            Json response;
+            std::string error;
+            if (!sendCommand(opts.socketPath, "cmd.host.radio.list", Json::object(),
+                             &response, &error)) {
+                std::cerr << error << "\n";
+                return 1;
+            }
+            const Json radios = jsonArray(response, "radios");
+            if (opts.jsonOutput)
+                std::cout << dumpIndented(radios);
+            else
+                printRadioTable(radios);
+            return 0;
+        }
+
+        Json payload = Json::object();
+        payload["resourceId"] = opts.resourceId;
+        if (opts.action == "claim")
+            payload["claimant"] = opts.claimant;
+
+        Json response;
+        std::string error;
+        if (!sendCommand(opts.socketPath, "cmd.host.radio." + opts.action, payload,
+                         &response, &error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+
+        if (opts.jsonOutput) {
+            std::cout << dumpIndented(response);
+            return 0;
+        }
+
+        if (opts.action == "probe") {
+            const std::string family = jsonString(response, "radioFamily");
+            // A port that answers nothing anybody here understands is the
+            // interesting case rather than a failure: the raw answer is printed
+            // so that whoever plugged the stick in can say what it was.
+            std::cout << opts.resourceId << ": "
+                      << (family.empty() ? "answered nothing this host recognises" : family) << "\n";
+            const std::string answer = jsonString(response, "answer");
+            if (!answer.empty())
+                std::cout << "answer: " << answer << "\n";
+            return 0;
+        }
+
+        if (opts.action == "claim") {
+            std::cout << opts.resourceId << " is held by " << opts.claimant << " for tenant "
+                      << jsonString(response, "tenant") << "\n";
+            return 0;
+        }
+
+        std::cout << opts.resourceId << " released\n";
+        return 0;
+    }
+
+    if (opts.scope == "backend") {
+        if (opts.action == "list") {
+            Json response;
+            std::string error;
+            if (!sendCommand(opts.socketPath, "cmd.host.backends.list", Json::object(),
+                             &response, &error)) {
+                std::cerr << error << "\n";
+                return 1;
+            }
+            if (opts.jsonOutput) {
+                std::cout << dumpIndented(response);
+                return 0;
+            }
+            printBackendTable(jsonArray(response, "backends"));
+            printBackendKinds(jsonArray(response, "kinds"));
+            return 0;
+        }
+
+        if (opts.action == "create") {
+            Json payload = Json::object();
+            payload["kind"] = opts.backendKind;
+            payload["id"] = opts.backendId;
+            payload["resourceId"] = opts.resourceId;
+
+            Json response;
+            std::string error;
+            if (!sendCommand(opts.socketPath, "cmd.host.backend.create", payload,
+                             &response, &error)) {
+                std::cerr << error << "\n";
+                return 1;
+            }
+            if (opts.jsonOutput) {
+                std::cout << dumpIndented(response);
+                return 0;
+            }
+
+            const Json backend = jsonObject(response, "backend");
+            std::cout << jsonString(backend, "name") << " created on "
+                      << jsonString(backend, "resourceId") << "\n";
+            const std::string unit = jsonString(backend, "unit");
+            if (!unit.empty())
+                std::cout << "unit: " << unit << " (" << jsonString(backend, "state") << ")\n";
+            // The backend exists and holds its radio, so this is a report on
+            // the unit rather than on the command: the record is the intention,
+            // and a runtime that will not come up today is brought up when
+            // whatever is wrong is fixed.
+            const std::string note = jsonString(response, "note");
+            if (!note.empty())
+                std::cerr << note << "\n";
+            return 0;
+        }
+
+        if (opts.action == "remove") {
+            Json payload = Json::object();
+            payload["name"] = opts.backendKind + "@" + opts.backendId;
+
+            Json response;
+            std::string error;
+            if (!sendCommand(opts.socketPath, "cmd.host.backend.remove", payload,
+                             &response, &error)) {
+                std::cerr << error << "\n";
+                return 1;
+            }
+            std::cout << jsonString(response, "name") << " removed\n";
+            const std::string note = jsonString(response, "note");
+            if (!note.empty())
+                std::cerr << note << "\n";
+            return 0;
+        }
+
+        Json payload = Json::object();
+        payload["kind"] = opts.backendKind;
+        payload["id"] = opts.backendId;
+
+        Json response;
+        std::string error;
+        if (!sendCommand(opts.socketPath, "cmd.host.backend." + opts.action, payload,
+                         &response, &error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+        std::cout << jsonString(response, "backend") << " " << opts.action << ": "
+                  << jsonString(response, "state") << "\n";
+        return 0;
     }
 
     if (opts.action == "list") {

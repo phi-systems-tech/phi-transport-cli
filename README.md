@@ -50,6 +50,31 @@ Provide a CLI transport boundary while keeping `phi-core` as the single backend 
 - Structured error output
 - Local CLI client (`phi-cli`) with adapter list/start/stop/restart/reload
 - Local CLI client (`phi-cli`) with transport start/stop/restart/reload
+- Local CLI client (`phi-cli`) with radio list/probe/claim/release and backend
+  list/create/remove/start/stop/restart
+
+### Bringing up a coordinator without a browser
+
+The host layer's topics (`cmd.host.radio.*`, `cmd.host.backend*`) had no client
+but the settings page until now, so a headless box, a script or an installer had
+to speak the WebSocket protocol by hand to bind a stick. The same flow from a
+terminal:
+
+```
+phi-cli radio list                        # what is attached, and what holds it
+phi-cli radio probe usb-1a86:7523@1-4-if00   # ask a port that cannot say what it is
+phi-cli backend list                      # what is bound, and which kinds exist
+phi-cli backend create --kind zigbee2mqtt --id study --resource usb-1a86:7523@1-4-if00
+```
+
+Two things the host layer decides rather than this client:
+
+- **Writes belong to the host tenant.** Claiming a radio, creating a backend and
+  running one are refused for anyone else, so these commands work from the host
+  tenant's socket (tenant `1` by default) and are read-only from another's.
+- **A resource is named, never guessed.** `backend create` requires
+  `--resource`. The host layer picks a port by itself only where a rule under
+  `/usr/share/phi/intents` asked it to; a person at a terminal is not that rule.
 
 ### Runtime Model
 
