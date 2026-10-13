@@ -7,11 +7,13 @@
 // which is QLocalSocket's waitFor... trio written as poll().
 
 #include "cli_socket.h"
+#include "scram_verifier.h"
 
 #include <envelope.h>
 #include <nlohmann/json.hpp>
 #include <phi/runtime/str.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <cstring>
@@ -24,6 +26,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <sys/types.h>
+#include <termios.h>
 #include <unistd.h>
 
 namespace {
@@ -195,7 +198,9 @@ void printUsage()
         << "  phi-cli backend intents [--tenant <tenant>] [--socket <path>] [--json]\n"
         << "  phi-cli backend create --kind <kind> --id <name> --resource <resource> [--json] [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backend remove <backend> [--tenant <tenant>] [--socket <path>]\n"
-        << "  phi-cli backend start|stop|restart <backend> [--tenant <tenant>] [--socket <path>]\n";
+        << "  phi-cli backend start|stop|restart <backend> [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli user list [--tenant <tenant>] [--socket <path>] [--json]\n"
+        << "  phi-cli user passwd <username> [--password-stdin] [--tenant <tenant>] [--socket <path>]\n";
 }
 
 std::string boolText(bool value)
@@ -337,6 +342,27 @@ void printBackendKinds(const Json &kinds)
     for (const Json &entry : kinds) {
         const std::string displayName = jsonString(entry, "displayName");
         std::cout << "  " << cell(jsonString(entry, "kind"), 18) << displayName << "\n";
+    }
+}
+
+/// Users as core lists them. The flags are core's UserFlag bits; the three
+/// that decide what an account is are spelled out, the rest stay a number.
+void printUserTable(const Json &users)
+{
+    constexpr int kEnabled = 0x0001;
+    constexpr int kOwner = 0x0010;
+    constexpr int kAdmin = 0x0020;
+
+    std::cout << cell("ID", 6) << cell("USERNAME", 24) << cell("ENABLED", 10)
+              << cell("OWNER", 8) << cell("ADMIN", 8) << "FLAGS\n";
+    for (const Json &entry : users) {
+        const int flags = jsonInt(jsonValue(entry, "flags")).value_or(0);
+        std::cout << cell(scalarText(jsonValue(entry, "id")), 6)
+                  << cell(jsonString(entry, "username"), 24)
+                  << cell(boolText((flags & kEnabled) != 0), 10)
+                  << cell(boolText((flags & kOwner) != 0), 8)
+                  << cell(boolText((flags & kAdmin) != 0), 8)
+                  << flags << "\n";
     }
 }
 
@@ -638,6 +664,11 @@ struct CliOptions {
     std::string claimant;
     std::string backendKind;
     std::string backendId;
+    // `user passwd`: whose password, and whether it comes from a pipe rather
+    // than a prompt. Never from an argument, which ps and the shell history
+    // would both keep.
+    std::string username;
+    bool passwordStdin = false;
 };
 
 /// `kind@id` back into its two halves - the shape `backendName()` composes on
@@ -806,6 +837,47 @@ bool parseHostScope(const std::vector<std::string> &positionalArgs, CliOptions *
     return true;
 }
 
+/// `user list` and `user passwd <username>`.
+bool parseUserScope(const std::vector<std::string> &positionalArgs, CliOptions *opts,
+                    std::string *errorOut)
+{
+    const auto refuse = [errorOut](const std::string &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+    if (opts->action != "list" && opts->action != "passwd")
+        return refuse("Unknown action: " + opts->action);
+
+    for (std::size_t i = 3; i < positionalArgs.size(); ++i) {
+        const std::string &arg = positionalArgs.at(i);
+        if (arg == "--json" && opts->action == "list") {
+            opts->jsonOutput = true;
+            continue;
+        }
+        if (arg == "--password-stdin" && opts->action == "passwd") {
+            opts->passwordStdin = true;
+            continue;
+        }
+        if (arg == "--socket") {
+            if (i + 1 >= positionalArgs.size())
+                return refuse("Missing value for --socket");
+            opts->socketPath = positionalArgs.at(++i);
+            opts->socketPathExplicit = true;
+            continue;
+        }
+        if (!arg.starts_with("-") && opts->action == "passwd" && opts->username.empty()) {
+            opts->username = str::trimmed(arg);
+            continue;
+        }
+        return refuse("Unknown argument: " + arg);
+    }
+
+    if (opts->action == "passwd" && opts->username.empty())
+        return refuse("user passwd requires <username>");
+    return true;
+}
+
 bool parseCliOptions(const std::vector<std::string> &args, CliOptions *optsOut, std::string *errorOut)
 {
     if (!optsOut)
@@ -893,8 +965,11 @@ bool parseCliOptions(const std::vector<std::string> &args, CliOptions *optsOut, 
         return true;
     }
 
-    if (opts.scope == "radio" || opts.scope == "backend") {
-        if (!parseHostScope(positionalArgs, &opts, errorOut))
+    if (opts.scope == "radio" || opts.scope == "backend" || opts.scope == "user") {
+        const bool parsed = opts.scope == "user"
+            ? parseUserScope(positionalArgs, &opts, errorOut)
+            : parseHostScope(positionalArgs, &opts, errorOut);
+        if (!parsed)
             return false;
 
         if (!isValidTenant(opts.tenant)) {
@@ -1193,6 +1268,71 @@ bool dropRootToPhi(std::string *errorOut)
     return true;
 }
 
+// ------------------------------------------------------------------ passwords
+
+/// The UI's floor, so an account set up here can also be changed there.
+constexpr std::size_t kMinPasswordChars = 8;
+
+/// Characters, not bytes: "ä" is one character to whoever typed it.
+std::size_t utf8Length(const std::string &text)
+{
+    std::size_t count = 0;
+    for (const unsigned char c : text) {
+        if ((c & 0xC0) != 0x80)
+            ++count;
+    }
+    return count;
+}
+
+/// One line from stdin with its line ending removed. With `prompt`, the
+/// terminal stops echoing while it is typed.
+bool readSecretLine(const char *prompt, std::string *out)
+{
+    termios saved{};
+    const bool tty = prompt != nullptr && isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &saved) == 0;
+    if (tty) {
+        std::cerr << prompt << std::flush;
+        termios quiet = saved;
+        quiet.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &quiet);
+    }
+    const bool ok = static_cast<bool>(std::getline(std::cin, *out));
+    if (tty) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+        std::cerr << "\n";
+    }
+    if (ok && !out->empty() && out->back() == '\r')
+        out->pop_back();
+    return ok;
+}
+
+/// The new password: typed twice at a terminal, or one line from a pipe.
+bool readNewPassword(const CliOptions &opts, std::string *out, std::string *errorOut)
+{
+    const auto refuse = [errorOut](const std::string &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+
+    if (opts.passwordStdin || !isatty(STDIN_FILENO)) {
+        if (!readSecretLine(nullptr, out))
+            return refuse("No password on stdin");
+    } else {
+        std::string again;
+        const std::string prompt = "New password for " + opts.username + ": ";
+        if (!readSecretLine(prompt.c_str(), out) || !readSecretLine("Repeat it: ", &again))
+            return refuse("No password entered");
+        if (*out != again)
+            return refuse("The two passwords differ");
+    }
+
+    if (utf8Length(*out) < kMinPasswordChars)
+        return refuse("A password needs at least " + str::number(static_cast<int>(kMinPasswordChars))
+                      + " characters");
+    return true;
+}
+
 std::vector<int> resolveAdapterIds(const CliOptions &opts, const Json &adapters, std::string *errorOut)
 {
     std::vector<int> ids;
@@ -1260,6 +1400,53 @@ int main(int argc, char **argv)
             std::cerr << parseError << "\n";
         printUsage();
         return 2;
+    }
+
+    if (opts.scope == "user") {
+        if (opts.action == "list") {
+            Json response;
+            std::string error;
+            if (!sendCommand(opts.socketPath, "cmd.users.list", Json::object(), &response, &error)) {
+                std::cerr << error << "\n";
+                return 1;
+            }
+            const Json users = jsonArray(response, "users");
+            if (opts.jsonOutput)
+                std::cout << dumpIndented(users);
+            else
+                printUserTable(users);
+            return 0;
+        }
+
+        std::string password;
+        std::string error;
+        if (!readNewPassword(opts, &password, &error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+        phicore::cli::ScramVerifier verifier;
+        const bool derived = phicore::cli::deriveScramVerifier(
+            password, phicore::cli::kScramIterations, &verifier, &error);
+        std::fill(password.begin(), password.end(), '\0');
+        if (!derived) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+
+        Json payload = Json::object();
+        payload["username"] = opts.username;
+        payload["salt"] = verifier.salt;
+        payload["iterations"] = verifier.iterations;
+        payload["storedKey"] = verifier.storedKey;
+        payload["serverKey"] = verifier.serverKey;
+        Json response;
+        if (!sendCommand(opts.socketPath, "cmd.users.password.set", payload, &response, &error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+        std::cout << "Password set for " << jsonString(response, "username")
+                  << "; their sessions have ended\n";
+        return 0;
     }
 
     // The host layer first, because `list` means one thing under `radio` and

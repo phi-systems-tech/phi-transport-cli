@@ -15,6 +15,7 @@ include(GNUInstallDirs)
 # blocking client: nlohmann for JSON, the transport api for the envelope rules
 # both sides of the wire have to agree on, and poll() for the waiting.
 find_package(nlohmann_json REQUIRED)
+find_package(OpenSSL REQUIRED)
 find_package(phi-transport-api 2.1.0 CONFIG QUIET)
 
 if(NOT TARGET phicore::transport-api AND NOT TARGET phi_transport_api)
@@ -53,11 +54,14 @@ add_executable(phi-cli
     src/phi_cli_main.cpp
     src/cli_socket.cpp
     src/cli_socket.h
+    src/scram_verifier.cpp
+    src/scram_verifier.h
 )
 
 target_link_libraries(phi-cli
     PRIVATE
         nlohmann_json::nlohmann_json
+        OpenSSL::Crypto
         ${PHI_TRANSPORT_API_TARGET}
 )
 
