@@ -16,7 +16,7 @@ include(GNUInstallDirs)
 # both sides of the wire have to agree on, and poll() for the waiting.
 find_package(nlohmann_json REQUIRED)
 find_package(OpenSSL REQUIRED)
-find_package(phi-transport-api 2.1.0 CONFIG QUIET)
+find_package(phi-transport-api 2.2.0 CONFIG QUIET)
 
 if(NOT TARGET phicore::transport-api AND NOT TARGET phi_transport_api)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../phi-transport-api/CMakeLists.txt")

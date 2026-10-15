@@ -9,7 +9,7 @@ Build-Depends:
  nlohmann-json3-dev,
  libssl-dev,
  libphi-runtime-dev,
- phi-transport-api-dev (>= 2.1.0)
+ phi-transport-api-dev (>= 2.2.0)
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 Homepage: https://phisys.com
