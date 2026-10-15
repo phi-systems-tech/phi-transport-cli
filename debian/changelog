@@ -1,3 +1,9 @@
+phi-transport-cli (0.0~git202610151202.e8509a7-1) trixie; urgency=medium
+
+  * Build against transport API 2.2.0
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Thu, 15 Oct 2026 12:02:25 +0200
+
 phi-transport-cli (0.0~git202609101658.1e84f2b-1) trixie; urgency=medium
 
   * Snapshot build.
