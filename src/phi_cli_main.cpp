@@ -13,10 +13,14 @@
 #include <nlohmann/json.hpp>
 #include <phi/runtime/str.h>
 
+#include <openssl/evp.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -26,7 +30,9 @@
 #include <pwd.h>
 #include <grp.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <termios.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 namespace {
@@ -200,7 +206,16 @@ void printUsage()
         << "  phi-cli backend remove <backend> [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backend start|stop|restart <backend> [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli user list [--tenant <tenant>] [--socket <path>] [--json]\n"
-        << "  phi-cli user passwd <username> [--password-stdin] [--tenant <tenant>] [--socket <path>]\n";
+        << "  phi-cli user passwd <username> [--password-stdin] [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backup list [--json] [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backup passphrase [--password-stdin] [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backup create [--history] [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backup show <file>\n"
+        << "  phi-cli backup import <file> [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backup inspect <backupId|file> [--no-passphrase] [--password-stdin] [--json] [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backup restore <backupId|file> [--allow-other-tenant] [--password-stdin] [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backup export <backupId> <file> [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backup delete <backupId> [--tenant <tenant>] [--socket <path>]\n";
 }
 
 std::string boolText(bool value)
@@ -669,6 +684,13 @@ struct CliOptions {
     // would both keep.
     std::string username;
     bool passwordStdin = false;
+    // `backup ...`: the backup or file named, where an export goes, and the
+    // switches. The passphrase never comes as an argument either.
+    std::string backupTarget;
+    std::string backupOut;
+    bool includeHistory = false;
+    bool allowOtherTenant = false;
+    bool noPassphrase = false;
 };
 
 /// `kind@id` back into its two halves - the shape `backendName()` composes on
@@ -878,6 +900,52 @@ bool parseUserScope(const std::vector<std::string> &positionalArgs, CliOptions *
     return true;
 }
 
+/// `backup <action> ...` (docs/backup-concept.md in phi-core).
+bool parseBackupScope(const std::vector<std::string> &positionalArgs, CliOptions *opts, std::string *errorOut)
+{
+    const auto refuse = [errorOut](const std::string &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+    static const std::vector<std::string> kActions = {"list",    "passphrase", "create", "show",  "import",
+                                                      "inspect", "restore",    "export", "delete"};
+    if (std::find(kActions.begin(), kActions.end(), opts->action) == kActions.end())
+        return refuse("Unknown action: " + opts->action);
+
+    for (std::size_t i = 3; i < positionalArgs.size(); ++i) {
+        const std::string &arg = positionalArgs.at(i);
+        if (arg == "--json") {
+            opts->jsonOutput = true;
+        } else if (arg == "--history") {
+            opts->includeHistory = true;
+        } else if (arg == "--allow-other-tenant") {
+            opts->allowOtherTenant = true;
+        } else if (arg == "--no-passphrase") {
+            opts->noPassphrase = true;
+        } else if (arg == "--password-stdin") {
+            opts->passwordStdin = true;
+        } else if (arg == "--socket") {
+            if (i + 1 >= positionalArgs.size())
+                return refuse("Missing value for --socket");
+            opts->socketPath = positionalArgs.at(++i);
+            opts->socketPathExplicit = true;
+        } else if (!arg.starts_with("-") && opts->backupTarget.empty()) {
+            opts->backupTarget = arg;
+        } else if (!arg.starts_with("-") && opts->action == "export" && opts->backupOut.empty()) {
+            opts->backupOut = arg;
+        } else {
+            return refuse("Unknown argument: " + arg);
+        }
+    }
+    const bool needsTarget = opts->action != "list" && opts->action != "passphrase" && opts->action != "create";
+    if (needsTarget && opts->backupTarget.empty())
+        return refuse("backup " + opts->action + " needs a backup id or a file");
+    if (opts->action == "export" && opts->backupOut.empty())
+        return refuse("backup export needs the file to write");
+    return true;
+}
+
 bool parseCliOptions(const std::vector<std::string> &args, CliOptions *optsOut, std::string *errorOut)
 {
     if (!optsOut)
@@ -965,10 +1033,10 @@ bool parseCliOptions(const std::vector<std::string> &args, CliOptions *optsOut, 
         return true;
     }
 
-    if (opts.scope == "radio" || opts.scope == "backend" || opts.scope == "user") {
-        const bool parsed = opts.scope == "user"
-            ? parseUserScope(positionalArgs, &opts, errorOut)
-            : parseHostScope(positionalArgs, &opts, errorOut);
+    if (opts.scope == "radio" || opts.scope == "backend" || opts.scope == "user" || opts.scope == "backup") {
+        const bool parsed = opts.scope == "user"   ? parseUserScope(positionalArgs, &opts, errorOut)
+                            : opts.scope == "backup" ? parseBackupScope(positionalArgs, &opts, errorOut)
+                                                     : parseHostScope(positionalArgs, &opts, errorOut);
         if (!parsed)
             return false;
 
@@ -1382,16 +1450,425 @@ std::vector<int> resolveAdapterIds(const CliOptions &opts, const Json &adapters,
     return ids;
 }
 
+
+// ------------------------------------------------------------------ backup
+
+constexpr std::size_t kBackupPieceBytes = 512 * 1024;
+constexpr int kBackupWaitMs = 15 * 60 * 1000;
+
+/// The files a backup command reads or writes, opened while still root: the
+/// one an admin names is usually theirs, not phi's.
+struct BackupFiles {
+    std::FILE *in = nullptr;
+    std::FILE *out = nullptr;
+    ~BackupFiles()
+    {
+        if (in)
+            std::fclose(in);
+        if (out)
+            std::fclose(out);
+    }
+};
+
+bool isFileTarget(const std::string &target)
+{
+    struct stat st {};
+    return target.find('/') != std::string::npos || (::stat(target.c_str(), &st) == 0 && S_ISREG(st.st_mode));
+}
+
+bool openBackupFiles(const CliOptions &opts, BackupFiles *files, std::string *errorOut)
+{
+    const bool reads = opts.action == "show" || opts.action == "import"
+                       || ((opts.action == "inspect" || opts.action == "restore") && isFileTarget(opts.backupTarget));
+    if (reads) {
+        files->in = std::fopen(opts.backupTarget.c_str(), "rb");
+        if (!files->in) {
+            *errorOut = "Cannot read " + opts.backupTarget + ": " + std::strerror(errno);
+            return false;
+        }
+    }
+    if (opts.action == "export") {
+        const int fd = ::open(opts.backupOut.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0 || !(files->out = ::fdopen(fd, "wb"))) {
+            if (fd >= 0)
+                ::close(fd);
+            *errorOut = "Cannot create " + opts.backupOut + ": " + std::strerror(errno);
+            return false;
+        }
+    }
+    return true;
+}
+
+std::uint64_t readBe(const unsigned char *in, int bytes)
+{
+    std::uint64_t value = 0;
+    for (int i = 0; i < bytes; ++i)
+        value = (value << 8) | in[i];
+    return value;
+}
+
+/// The clear header of a .phibackup file: what `show` prints without a key.
+std::optional<Json> readBackupHeader(std::FILE *file, std::string *errorOut)
+{
+    char magic[8];
+    unsigned char footer[20];
+    if (::fseeko(file, 0, SEEK_END) != 0) {
+        *errorOut = "Cannot read the file";
+        return std::nullopt;
+    }
+    const off_t size = ::ftello(file);
+    if (size < 28 || ::fseeko(file, 0, SEEK_SET) != 0 || std::fread(magic, 1, 8, file) != 8
+        || std::memcmp(magic, "PHIBAK01", 8) != 0) {
+        *errorOut = "Not a backup file";
+        return std::nullopt;
+    }
+    if (::fseeko(file, size - 20, SEEK_SET) != 0 || std::fread(footer, 1, 20, file) != 20
+        || std::memcmp(footer + 12, "PHIBAKFT", 8) != 0) {
+        *errorOut = "The backup file is incomplete";
+        return std::nullopt;
+    }
+    const std::uint64_t offset = readBe(footer, 8);
+    const std::uint64_t length = readBe(footer + 8, 4);
+    if (offset < 8 || length > 4 * 1024 * 1024 || offset + length != static_cast<std::uint64_t>(size) - 20) {
+        *errorOut = "The backup file is damaged";
+        return std::nullopt;
+    }
+    std::string text(static_cast<std::size_t>(length), '\0');
+    if (::fseeko(file, static_cast<off_t>(offset), SEEK_SET) != 0
+        || std::fread(text.data(), 1, text.size(), file) != text.size()) {
+        *errorOut = "The backup file is damaged";
+        return std::nullopt;
+    }
+    Json header = parseJson(text);
+    if (!header.is_object() || jsonString(header, "format") != "phibackup") {
+        *errorOut = "The backup file is damaged";
+        return std::nullopt;
+    }
+    return header;
+}
+
+std::string utcTime(long long ms)
+{
+    if (ms <= 0)
+        return "-";
+    const std::time_t sec = static_cast<std::time_t>(ms / 1000);
+    std::tm tm{};
+    gmtime_r(&sec, &tm);
+    char buf[32];
+    std::strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S UTC", &tm);
+    return buf;
+}
+
+std::string byteSize(long long bytes)
+{
+    const char *units[] = {"B", "KiB", "MiB", "GiB"};
+    double value = static_cast<double>(bytes);
+    int unit = 0;
+    while (value >= 1024 && unit < 3) {
+        value /= 1024;
+        ++unit;
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof buf, unit == 0 ? "%.0f %s" : "%.1f %s", value, units[unit]);
+    return buf;
+}
+
+long long jsonLong(const Json &obj, std::string_view key)
+{
+    const Json value = jsonValue(obj, key);
+    return value.is_number() ? value.get<long long>() : 0;
+}
+
+void printBackupHeader(const Json &header)
+{
+    std::cout << "Created  " << utcTime(jsonLong(header, "createdMs")) << "\n"
+              << "Host     " << jsonString(header, "host") << "\n"
+              << "Core     " << jsonString(header, "coreVersion") << ", schema "
+              << jsonLong(header, "schemaVersion") << "\n\n";
+    std::cout << cell("PART", 16) << cell("KIND", 10) << cell("SIZE", 12) << "HISTORY\n";
+    for (const Json &part : jsonArray(header, "parts")) {
+        const Json history = jsonValue(part, "includesHistory");
+        std::cout << cell(jsonString(part, "id"), 16) << cell(jsonString(part, "kind"), 10)
+                  << cell(byteSize(jsonLong(part, "length")), 12)
+                  << (history.is_boolean() ? boolText(history.get<bool>()) : std::string("-")) << "\n";
+    }
+    std::vector<std::string> labels;
+    for (const Json &recipient : jsonArray(header, "recipients"))
+        labels.push_back(jsonString(recipient, "label"));
+    std::cout << "\nOpened by the passphrase of: " << str::join(labels, ", ") << "\n";
+}
+
+bool sha256OfFile(std::FILE *file, std::uint64_t *size, std::string *hex)
+{
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    bool ok = ctx && EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) == 1 && ::fseeko(file, 0, SEEK_SET) == 0;
+    std::vector<char> buffer(64 * 1024);
+    *size = 0;
+    while (ok) {
+        const std::size_t n = std::fread(buffer.data(), 1, buffer.size(), file);
+        if (n == 0)
+            break;
+        ok = EVP_DigestUpdate(ctx, buffer.data(), n) == 1;
+        *size += n;
+    }
+    unsigned char digest[32];
+    unsigned int len = 0;
+    ok = ok && !std::ferror(file) && EVP_DigestFinal_ex(ctx, digest, &len) == 1 && len == 32;
+    EVP_MD_CTX_free(ctx);
+    if (ok)
+        *hex = str::toHex(std::string_view(reinterpret_cast<const char *>(digest), 32));
+    return ok;
+}
+
+/// Sends the file to the tenant's core in pieces; the backupId it became.
+std::optional<std::string> uploadBackup(const CliOptions &opts, std::FILE *file, std::string *errorOut)
+{
+    if (!readBackupHeader(file, errorOut))
+        return std::nullopt;
+    std::uint64_t size = 0;
+    std::string hex;
+    if (!sha256OfFile(file, &size, &hex)) {
+        *errorOut = "Cannot read the file";
+        return std::nullopt;
+    }
+    Json response;
+    if (!sendCommand(opts.socketPath, "cmd.backup.upload.begin", Json{{"sizeBytes", size}, {"sha256", hex}},
+                     &response, errorOut))
+        return std::nullopt;
+    const std::string uploadId = jsonString(response, "uploadId");
+    std::vector<char> buffer(kBackupPieceBytes);
+    std::uint64_t offset = 0;
+    ::fseeko(file, 0, SEEK_SET);
+    while (offset < size) {
+        const std::size_t n = std::fread(buffer.data(), 1, buffer.size(), file);
+        if (n == 0) {
+            *errorOut = "Cannot read the file";
+            return std::nullopt;
+        }
+        const Json piece{{"uploadId", uploadId},
+                         {"offset", offset},
+                         {"data", str::toBase64(std::string_view(buffer.data(), n))}};
+        if (!sendCommand(opts.socketPath, "cmd.backup.upload.chunk", piece, &response, errorOut))
+            return std::nullopt;
+        offset += n;
+        if (jsonBool(response, "done"))
+            return jsonString(response, "backupId");
+    }
+    *errorOut = "The upload did not finish";
+    return std::nullopt;
+}
+
+/// One passphrase: a line from a pipe, or typed once at the terminal.
+bool readPassphrase(const CliOptions &opts, const std::string &prompt, std::string *out, std::string *errorOut)
+{
+    const bool piped = opts.passwordStdin || !isatty(STDIN_FILENO);
+    if (!readSecretLine(piped ? nullptr : prompt.c_str(), out)) {
+        *errorOut = "No passphrase entered";
+        return false;
+    }
+    return true;
+}
+
+int runBackupCommand(const CliOptions &opts, BackupFiles &files)
+{
+    std::string error;
+    const auto fail = [&error]() {
+        std::cerr << error << "\n";
+        return 1;
+    };
+
+    if (opts.action == "show") {
+        const auto header = readBackupHeader(files.in, &error);
+        if (!header)
+            return fail();
+        if (opts.jsonOutput)
+            std::cout << dumpIndented(*header);
+        else
+            printBackupHeader(*header);
+        return 0;
+    }
+
+    Json response;
+    if (opts.action == "list") {
+        if (!sendCommand(opts.socketPath, "cmd.backups.list", Json::object(), &response, &error))
+            return fail();
+        if (opts.jsonOutput) {
+            std::cout << dumpIndented(response);
+            return 0;
+        }
+        std::cout << "Backup passphrase: " << (jsonBool(response, "passphraseSet") ? "set" : "not set") << "\n\n";
+        std::cout << cell("BACKUP", 44) << cell("CREATED", 26) << cell("SIZE", 12) << "PARTS\n";
+        for (const Json &entry : jsonArray(response, "backups")) {
+            std::vector<std::string> parts;
+            for (const Json &part : jsonArray(entry, "parts"))
+                parts.push_back(jsonString(part, "id"));
+            std::cout << cell(jsonString(entry, "backupId"), 44) << cell(utcTime(jsonLong(entry, "tsMs")), 26)
+                      << cell(byteSize(jsonLong(entry, "sizeBytes")), 12) << str::join(parts, ", ") << "\n";
+        }
+        return 0;
+    }
+
+    if (opts.action == "passphrase") {
+        if (!sendCommand(opts.socketPath, "cmd.backups.list", Json::object(), &response, &error))
+            return fail();
+        Json payload = Json::object();
+        std::string current;
+        if (jsonBool(response, "passphraseSet")) {
+            if (!readPassphrase(opts, "Current backup passphrase: ", &current, &error))
+                return fail();
+            payload["oldPassphrase"] = current;
+        }
+        std::string next;
+        if (!readPassphrase(opts, "New backup passphrase: ", &next, &error))
+            return fail();
+        if (!opts.passwordStdin && isatty(STDIN_FILENO)) {
+            std::string again;
+            if (!readPassphrase(opts, "Repeat it: ", &again, &error))
+                return fail();
+            if (again != next) {
+                error = "The two passphrases differ";
+                return fail();
+            }
+        }
+        payload["passphrase"] = next;
+        const bool ok = sendCommand(opts.socketPath, "cmd.backup.passphrase.set", payload, &response, &error);
+        std::fill(next.begin(), next.end(), '\0');
+        std::fill(current.begin(), current.end(), '\0');
+        if (!ok)
+            return fail();
+        std::cout << "Backup passphrase set. Without it no backup of this tenant can be restored.\n";
+        return 0;
+    }
+
+    if (opts.action == "create") {
+        if (!sendCommand(opts.socketPath, "cmd.backup.create", Json{{"includeHistory", opts.includeHistory}},
+                         &response, &error))
+            return fail();
+        const std::string backupId = jsonString(response, "backupId");
+        std::cerr << "Making " << backupId << " ..." << std::flush;
+        // The end comes as an event; a command line has none, so it asks.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kBackupWaitMs);
+        while (std::chrono::steady_clock::now() < deadline) {
+            ::usleep(500 * 1000);
+            if (!sendCommand(opts.socketPath, "cmd.backups.list", Json::object(), &response, &error))
+                return fail();
+            if (jsonBool(response, "busy"))
+                continue;
+            std::cerr << "\n";
+            for (const Json &entry : jsonArray(response, "backups")) {
+                if (jsonString(entry, "backupId") == backupId) {
+                    std::cout << backupId << " (" << byteSize(jsonLong(entry, "sizeBytes")) << ")\n";
+                    return 0;
+                }
+            }
+            error = "The backup failed; journalctl -u phi-core@" + opts.tenant + " says why";
+            return fail();
+        }
+        error = "\nThe backup is still running";
+        return fail();
+    }
+
+    std::string backupId = opts.backupTarget;
+    if (opts.action == "import" || files.in) {
+        const auto uploaded = uploadBackup(opts, files.in, &error);
+        if (!uploaded)
+            return fail();
+        backupId = *uploaded;
+        if (opts.action == "import") {
+            std::cout << backupId << "\n";
+            return 0;
+        }
+        std::cerr << "Uploaded as " << backupId << "\n";
+    }
+
+    if (opts.action == "delete") {
+        if (!sendCommand(opts.socketPath, "cmd.backup.delete", Json{{"backupId", backupId}}, &response, &error))
+            return fail();
+        std::cout << "Deleted " << backupId << "\n";
+        return 0;
+    }
+
+    if (opts.action == "export") {
+        for (std::uint64_t offset = 0;;) {
+            const Json ask{{"backupId", backupId}, {"offset", offset}, {"length", kBackupPieceBytes}};
+            if (!sendCommand(opts.socketPath, "cmd.backup.read", ask, &response, &error))
+                return fail();
+            const std::string data = str::fromBase64(jsonString(response, "data"));
+            if (std::fwrite(data.data(), 1, data.size(), files.out) != data.size()) {
+                error = "Cannot write " + opts.backupOut;
+                return fail();
+            }
+            offset += data.size();
+            if (jsonBool(response, "eof") || data.empty())
+                break;
+        }
+        if (std::fflush(files.out) != 0 || ::fsync(::fileno(files.out)) != 0) {
+            error = "Cannot write " + opts.backupOut;
+            return fail();
+        }
+        std::cout << "Wrote " << opts.backupOut << "\n";
+        return 0;
+    }
+
+    std::string passphrase;
+    if (!(opts.action == "inspect" && opts.noPassphrase)
+        && !readPassphrase(opts, "Backup passphrase: ", &passphrase, &error))
+        return fail();
+
+    if (opts.action == "inspect") {
+        const bool ok = sendCommand(opts.socketPath, "cmd.backup.inspect",
+                                    Json{{"backupId", backupId}, {"passphrase", passphrase}}, &response, &error);
+        std::fill(passphrase.begin(), passphrase.end(), '\0');
+        if (!ok)
+            return fail();
+        response.erase("accepted");
+        response.erase("error");
+        if (opts.jsonOutput) {
+            std::cout << dumpIndented(response);
+            return 0;
+        }
+        printBackupHeader(Json{{"createdMs", jsonValue(response, "createdMs")},
+                               {"host", jsonValue(response, "host")},
+                               {"coreVersion", jsonValue(response, "coreVersion")},
+                               {"schemaVersion", jsonValue(response, "schemaVersion")},
+                               {"parts", Json::array()}});
+        for (const Json &part : jsonArray(response, "parts")) {
+            std::cout << jsonString(part, "id") << " (" << jsonString(part, "kind") << ")";
+            const Json opens = jsonValue(part, "opens");
+            if (opens.is_boolean())
+                std::cout << (opens.get<bool>() ? ": opens" : ": does not open with this passphrase");
+            std::cout << "\n";
+            for (const Json &file : jsonArray(jsonObject(part, "manifest"), "files"))
+                std::cout << "  " << scalarText(file) << "\n";
+        }
+        if (!jsonString(response, "problem").empty())
+            std::cout << "\nCannot be restored here: " << jsonString(response, "problem") << "\n";
+        else if (!jsonString(response, "applies").empty())
+            std::cout << "\nA restore here applies " << jsonString(response, "applies")
+                      << (jsonBool(response, "otherTenant") ? " (another tenant's: --allow-other-tenant)" : "")
+                      << "\n";
+        return 0;
+    }
+
+    // restore
+    const bool ok = sendCommand(opts.socketPath, "cmd.backup.restore",
+                                Json{{"backupId", backupId},
+                                     {"passphrase", passphrase},
+                                     {"allowOtherTenant", opts.allowOtherTenant}},
+                                &response, &error);
+    std::fill(passphrase.begin(), passphrase.end(), '\0');
+    if (!ok)
+        return fail();
+    std::cout << "Restore of " << backupId << " staged; phi-core@" << opts.tenant
+              << " restarts and swaps it in. The replaced state stays in /var/lib/phi/@" << opts.tenant
+              << "/restore/.\n";
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
-    std::string dropError;
-    if (!dropRootToPhi(&dropError)) {
-        std::cerr << dropError << "\n";
-        return 1;
-    }
-
     const std::vector<std::string> args(argv, argv + argc);
     CliOptions opts;
     std::string parseError;
@@ -1401,6 +1878,26 @@ int main(int argc, char **argv)
         printUsage();
         return 2;
     }
+
+    // A backup file is opened before root is dropped: the one an admin names
+    // is theirs, and phi may not read it.
+    BackupFiles backupFiles;
+    if (opts.scope == "backup") {
+        std::string openError;
+        if (!openBackupFiles(opts, &backupFiles, &openError)) {
+            std::cerr << openError << "\n";
+            return 1;
+        }
+    }
+
+    std::string dropError;
+    if (!dropRootToPhi(&dropError)) {
+        std::cerr << dropError << "\n";
+        return 1;
+    }
+
+    if (opts.scope == "backup")
+        return runBackupCommand(opts, backupFiles);
 
     if (opts.scope == "user") {
         if (opts.action == "list") {

@@ -81,6 +81,28 @@ Two things the host layer decides rather than this client:
   `--resource`. The host layer picks a port by itself only where a rule under
   `/usr/share/phi/intents` asked it to; a person at a terminal is not that rule.
 
+### Backups
+
+A tenant's backups (phi-core `docs/backup-concept.md`) from a terminal, through
+the same commands the settings page uses:
+
+```
+phi-cli backup passphrase                 # once: the key every backup is sealed for
+phi-cli backup create --history           # a backup, made while everything runs
+phi-cli backup list
+phi-cli backup export <backupId> ~/house.phibackup
+phi-cli backup show ~/house.phibackup     # its part table, no passphrase needed
+phi-cli backup inspect ~/house.phibackup  # uploads it, then lists what the passphrase opens
+phi-cli backup restore ~/house.phibackup  # uploads it, stages it, and core restarts to swap it in
+```
+
+- **A file named on the command line is opened before root is dropped**, so it
+  may live where only its owner can read it; an export is created 0600.
+- **The passphrase is typed, or one line on stdin** (`--password-stdin`), never
+  an argument. Making a backup needs none.
+- **`restore` and `passphrase` are the owner's** when they come through a
+  session; the CLI socket is trusted locally, as for every other command here.
+
 ### Runtime Model
 
 - Runs as a `TransportInterface` shared-object plugin (Qt-free contract; the plugin uses Qt internally).
