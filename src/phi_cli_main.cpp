@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <iostream>
@@ -215,7 +216,9 @@ void printUsage()
         << "  phi-cli backup inspect <backupId|file> [--no-passphrase] [--password-stdin] [--json] [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backup restore <backupId|file> [--allow-other-tenant] [--password-stdin] [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backup export <backupId> <file> [--tenant <tenant>] [--socket <path>]\n"
-        << "  phi-cli backup delete <backupId> [--tenant <tenant>] [--socket <path>]\n";
+        << "  phi-cli backup delete <backupId> [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backup passphrase|create|list|inspect|restore|delete --box [...]   (root: every tenant and the host)\n"
+        << "  phi-cli backup create|restore --host [...]   (root: the host part only)\n";
 }
 
 std::string boolText(bool value)
@@ -1870,9 +1873,29 @@ int runBackupCommand(const CliOptions &opts, BackupFiles &files)
 
 } // namespace
 
+/// The box backup is a root tool of phi-core's (docs/backup-concept.md, P2):
+/// it reads every tenant and the host, so it keeps root, which this program
+/// drops before anything else.
+constexpr const char *kBoxBackupTool = "/usr/libexec/phi/phi-box-backup";
+
+[[noreturn]] void runBoxBackup(const std::vector<std::string> &args)
+{
+    std::vector<char *> argv;
+    argv.push_back(const_cast<char *>(kBoxBackupTool));
+    for (std::size_t i = 2; i < args.size(); ++i)
+        argv.push_back(const_cast<char *>(args[i].c_str()));
+    argv.push_back(nullptr);
+    ::execv(kBoxBackupTool, argv.data());
+    std::cerr << "Cannot run " << kBoxBackupTool << ": " << std::strerror(errno) << " (is phi-core installed?)\n";
+    std::exit(1);
+}
+
 int main(int argc, char **argv)
 {
     const std::vector<std::string> args(argv, argv + argc);
+    if (args.size() > 2 && args[1] == "backup"
+        && std::any_of(args.begin() + 2, args.end(), [](const std::string &a) { return a == "--box" || a == "--host"; }))
+        runBoxBackup(args);
     CliOptions opts;
     std::string parseError;
     if (!parseCliOptions(args, &opts, &parseError)) {
