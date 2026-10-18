@@ -1,3 +1,10 @@
+phi-transport-cli (0.0~git202610181518.f6233f7-1) trixie; urgency=medium
+
+  * backup --box and --host run phi-core's box backup tool, with root
+    kept.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Sun, 18 Oct 2026 15:18:44 +0200
+
 phi-transport-cli (0.0~git202610181215.6aaa6a3-1) trixie; urgency=medium
 
   * phi-cli backup: without a terminal, point at --password-stdin.
