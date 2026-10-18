@@ -1668,7 +1668,9 @@ bool readPassphrase(const CliOptions &opts, const std::string &prompt, std::stri
 {
     const bool piped = opts.passwordStdin || !isatty(STDIN_FILENO);
     if (!readSecretLine(piped ? nullptr : prompt.c_str(), out)) {
-        *errorOut = "No passphrase entered";
+        *errorOut = opts.passwordStdin || isatty(STDIN_FILENO)
+                        ? "No passphrase entered"
+                        : "No passphrase entered: there is no terminal to ask at; pipe it in with --password-stdin";
         return false;
     }
     return true;
