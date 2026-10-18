@@ -1579,12 +1579,17 @@ long long jsonLong(const Json &obj, std::string_view key)
     return value.is_number() ? value.get<long long>() : 0;
 }
 
-void printBackupHeader(const Json &header)
+void printBackupSummary(const Json &header)
 {
     std::cout << "Created  " << utcTime(jsonLong(header, "createdMs")) << "\n"
               << "Host     " << jsonString(header, "host") << "\n"
               << "Core     " << jsonString(header, "coreVersion") << ", schema "
               << jsonLong(header, "schemaVersion") << "\n\n";
+}
+
+void printBackupHeader(const Json &header)
+{
+    printBackupSummary(header);
     std::cout << cell("PART", 16) << cell("KIND", 10) << cell("SIZE", 12) << "HISTORY\n";
     for (const Json &part : jsonArray(header, "parts")) {
         const Json history = jsonValue(part, "includesHistory");
@@ -1827,11 +1832,7 @@ int runBackupCommand(const CliOptions &opts, BackupFiles &files)
             std::cout << dumpIndented(response);
             return 0;
         }
-        printBackupHeader(Json{{"createdMs", jsonValue(response, "createdMs")},
-                               {"host", jsonValue(response, "host")},
-                               {"coreVersion", jsonValue(response, "coreVersion")},
-                               {"schemaVersion", jsonValue(response, "schemaVersion")},
-                               {"parts", Json::array()}});
+        printBackupSummary(response);
         for (const Json &part : jsonArray(response, "parts")) {
             std::cout << jsonString(part, "id") << " (" << jsonString(part, "kind") << ")";
             const Json opens = jsonValue(part, "opens");
