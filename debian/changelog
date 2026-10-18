@@ -1,3 +1,9 @@
+phi-transport-cli (0.0~git202610181215.6aaa6a3-1) trixie; urgency=medium
+
+  * phi-cli backup: without a terminal, point at --password-stdin.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Sun, 18 Oct 2026 12:15:10 +0200
+
 phi-transport-cli (0.0~git202610181103.22c76ca-1) trixie; urgency=medium
 
   * phi-cli backup inspect: no empty part table.
