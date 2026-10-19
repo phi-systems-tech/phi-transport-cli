@@ -203,7 +203,7 @@ void printUsage()
         << "  phi-cli radio release <resource> [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backend list [--tenant <tenant>] [--socket <path>] [--json]\n"
         << "  phi-cli backend intents [--tenant <tenant>] [--socket <path>] [--json]\n"
-        << "  phi-cli backend create --kind <kind> --id <name> --resource <resource> [--json] [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli backend create --kind <kind> --id <name> [--resource <resource>] [--json] [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backend remove <backend> [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backend start|stop|restart <backend> [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli user list [--tenant <tenant>] [--socket <path>] [--json]\n"
@@ -842,9 +842,9 @@ bool parseHostScope(const std::vector<std::string> &positionalArgs, CliOptions *
         // Named rather than guessed. The host layer picks a port by itself only
         // where a rule under /usr/share/phi/intents asked it to, and a person
         // at a terminal is not that rule: creating a backend claims a piece of
-        // hardware, and which one is the operator's sentence to write.
-        if (opts->resourceId.empty())
-            return refuse("backend create requires --resource, the id from radio list");
+        // hardware, and which one is the operator's sentence to write. A kind
+        // that drives no radio takes none, and the host layer says so when one
+        // is named anyway.
         return true;
     }
 
