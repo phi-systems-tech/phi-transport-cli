@@ -1,3 +1,9 @@
+phi-transport-cli (0.0~git202610191430.997be0f-1) trixie; urgency=medium
+
+  * backend create: --resource optional for kinds without a radio
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Mon, 19 Oct 2026 14:30:25 +0200
+
 phi-transport-cli (0.0~git202610181518.f6233f7-1) trixie; urgency=medium
 
   * backup --box and --host run phi-core's box backup tool, with root
