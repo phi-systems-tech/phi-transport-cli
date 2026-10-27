@@ -1,3 +1,11 @@
+phi-transport-cli (0.0~git202610271410.8bc0c73-1) trixie; urgency=medium
+
+  *   * Command frames through commandframe.h (a mistyped member no
+    longer ends core); phi-cli derives verifiers with the shared
+    scram.h.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Tue, 27 Oct 2026 14:10:51 +0100
+
 phi-transport-cli (0.0~git202610191430.997be0f-1) trixie; urgency=medium
 
   * backend create: --resource optional for kinds without a radio
