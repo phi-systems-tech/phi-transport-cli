@@ -9,6 +9,8 @@
 #include "cli_socket.h"
 #include "scram_verifier.h"
 
+#include <commandframe.h>
+
 #include <envelope.h>
 #include <nlohmann/json.hpp>
 #include <phi/runtime/str.h>
@@ -137,16 +139,6 @@ std::optional<int> jsonInt(const Json &value)
         if (ok)
             return parsed;
     }
-    return std::nullopt;
-}
-
-std::optional<tapi::CmdId> readCid(const Json &value)
-{
-    // The contract's own rules, rather than a second reading of them here.
-    if (value.is_number())
-        return tapi::cidFromNumber(value.get<double>());
-    if (value.is_string())
-        return tapi::cidFromString(value.get<std::string>());
     return std::nullopt;
 }
 
@@ -448,7 +440,7 @@ bool sendCommand(const std::string &socketPath,
         if (!envelope.is_object())
             continue;
 
-        const auto responseCid = readCid(jsonValue(envelope, "cid"));
+        const auto responseCid = tapi::readCid(jsonValue(envelope, "cid"));
         if (!responseCid.has_value() || *responseCid != cid)
             continue;
 
@@ -568,7 +560,7 @@ bool runDiscoveryStream(const std::string &socketPath,
         const std::string topic = jsonString(envelope, "topic");
         const Json response = jsonObject(envelope, "payload");
 
-        const auto responseCid = readCid(jsonValue(envelope, "cid"));
+        const auto responseCid = tapi::readCid(jsonValue(envelope, "cid"));
         const bool cidMatches = responseCid.has_value() && *responseCid == cid;
 
         if (type == tapi::kEnvelopeTypeResponse && topic == tapi::kTopicCmdAck && cidMatches) {

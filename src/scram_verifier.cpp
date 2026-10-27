@@ -2,39 +2,20 @@
 
 #include "scram_verifier.h"
 
+#include <scram.h>
+
 #include <phi/runtime/str.h>
 
 #include <openssl/crypto.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
 #include <openssl/rand.h>
-#include <openssl/sha.h>
 
 #include <array>
-#include <cstring>
 
 namespace phicore::cli {
 
 namespace {
 
-constexpr int kKeyBytes = 32;   // SHA-256
 constexpr int kSaltBytes = 16;  // what the UI uses; core wants at least that
-
-using Key = std::array<unsigned char, kKeyBytes>;
-
-bool hmacSha256(const Key &key, const char *message, Key *out)
-{
-    unsigned int len = 0;
-    const unsigned char *result = HMAC(EVP_sha256(), key.data(), key.size(),
-                                       reinterpret_cast<const unsigned char *>(message),
-                                       std::strlen(message), out->data(), &len);
-    return result != nullptr && len == kKeyBytes;
-}
-
-std::string toBase64(const unsigned char *bytes, std::size_t size)
-{
-    return phi::str::toBase64(std::string_view(reinterpret_cast<const char *>(bytes), size));
-}
 
 } // namespace
 
@@ -51,38 +32,31 @@ bool deriveScramVerifier(const std::string &password,
     if (!out)
         return fail("no output");
 
-    std::array<unsigned char, kSaltBytes> salt{};
-    if (RAND_bytes(salt.data(), static_cast<int>(salt.size())) != 1)
+    std::array<unsigned char, kSaltBytes> saltBytes{};
+    if (RAND_bytes(saltBytes.data(), static_cast<int>(saltBytes.size())) != 1)
         return fail("no random salt");
+    const std::string salt(reinterpret_cast<const char *>(saltBytes.data()), saltBytes.size());
 
-    // SaltedPassword := PBKDF2-HMAC-SHA-256(password, salt, i)
-    Key salted{};
-    if (PKCS5_PBKDF2_HMAC(password.data(), static_cast<int>(password.size()),
-                          salt.data(), static_cast<int>(salt.size()), iterations,
-                          EVP_sha256(), kKeyBytes, salted.data()) != 1) {
+    // The derivation is core's own (phi-transport-api scram.h), so the two
+    // sides cannot drift apart.
+    std::string salted = scram::saltedPassword(password, salt, iterations);
+    if (salted.empty())
         return fail("PBKDF2 failed");
-    }
-
-    // StoredKey := SHA-256(HMAC(SaltedPassword, "Client Key"))
-    // ServerKey := HMAC(SaltedPassword, "Server Key")
-    Key clientKey{};
-    Key storedKey{};
-    Key serverKey{};
-    const bool ok = hmacSha256(salted, "Client Key", &clientKey)
-        && SHA256(clientKey.data(), clientKey.size(), storedKey.data()) != nullptr
-        && hmacSha256(salted, "Server Key", &serverKey);
+    std::string clientKey = scram::clientKey(salted);
+    const std::string storedKey = scram::storedKey(clientKey);
+    const std::string serverKey = scram::serverKey(salted);
 
     // The salted password and the client key are what a login proof is made
     // from, so neither outlives this call.
     OPENSSL_cleanse(salted.data(), salted.size());
     OPENSSL_cleanse(clientKey.data(), clientKey.size());
-    if (!ok)
+    if (storedKey.size() != scram::kKeyBytes || serverKey.size() != scram::kKeyBytes)
         return fail("HMAC failed");
 
-    out->salt = toBase64(salt.data(), salt.size());
+    out->salt = phi::str::toBase64(salt);
     out->iterations = iterations;
-    out->storedKey = toBase64(storedKey.data(), storedKey.size());
-    out->serverKey = toBase64(serverKey.data(), serverKey.size());
+    out->storedKey = phi::str::toBase64(storedKey);
+    out->serverKey = phi::str::toBase64(serverKey);
     return true;
 }
 

@@ -9,13 +9,15 @@
 
 #pragma once
 
+#include <scram.h>
+
 #include <string>
 
 namespace phicore::cli {
 
-/// PBKDF2 rounds for a new verifier: core's scram::kDefaultIterations, which
-/// is also what the UI uses. Core refuses anything outside 100000..4000000.
-inline constexpr int kScramIterations = 600000;
+/// PBKDF2 rounds for a new verifier: core's own default, which is also what
+/// the UI uses.
+inline constexpr int kScramIterations = scram::kDefaultIterations;
 
 /// The fields of a verifier as `cmd.users.password.set` takes them, each
 /// base64 encoded.

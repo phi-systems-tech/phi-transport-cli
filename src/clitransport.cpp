@@ -1,5 +1,7 @@
 #include "clitransport.h"
 
+#include <commandframe.h>
+
 #include <nlohmann/json.hpp>
 
 #include <fcntl.h>
@@ -11,6 +13,7 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <variant>
 
 namespace phicore::transport::cli {
 
@@ -39,15 +42,6 @@ std::string socketPathFromConfig(const Json &config)
         }
     }
     return kDefaultSocketPath;
-}
-
-std::optional<CmdId> readCid(const Json &value)
-{
-    if (value.is_number())
-        return cidFromNumber(value.get<double>());
-    if (value.is_string())
-        return cidFromString(value.get<std::string>());
-    return std::nullopt;
 }
 
 } // namespace
@@ -338,16 +332,7 @@ void CliTransport::sendCmdResponse(Client *client,
                                    const std::string &cmdTopic,
                                    std::string_view payloadJson)
 {
-    // The one outbound path that parses: `error: null` is added only if absent, and
-    // deciding that from raw text would be a substring guess. Command responses are
-    // user-driven, so the parse sits on the cheap side of the trade.
-    Json out = Json::parse(payloadJson, nullptr, false);
-    if (!out.is_object())
-        out = Json::object();
-    out["cmd"] = cmdTopic;
-    if (!out.contains("error"))
-        out["error"] = nullptr;
-    const std::string bytes = out.dump();
+    const std::string bytes = makeCmdResponsePayload(cmdTopic, payloadJson);
     send(client, kEnvelopeTypeResponse, kTopicCmdResponse, cid, bytes);
 }
 
@@ -407,39 +392,17 @@ void CliTransport::handleCommand(Client *client,
 
 void CliTransport::processLine(Client *client, std::string_view line)
 {
-    const Json doc = Json::parse(line, nullptr, false);
-    if (!doc.is_object()) {
-        sendProtocolError(client, std::nullopt, kErrorCodeInvalidJson, kMessageInvalidJson);
+    auto parsed = parseCommandFrame(line);
+    if (const auto *error = std::get_if<FrameError>(&parsed)) {
+        sendProtocolError(client, error->cid, error->code, error->message);
         return;
     }
-
-    const std::string type = doc.value("type", std::string());
-    std::string topic = doc.value("topic", std::string());
-    const Json payload = doc.contains("payload") && doc["payload"].is_object()
-        ? doc["payload"] : Json::object();
-
-    const std::optional<CmdId> cid = readCid(doc.contains("cid") ? doc["cid"] : Json());
-    if (!cid.has_value()) {
-        sendProtocolError(client, std::nullopt, kErrorCodeMissingCid, kMessageMissingCid);
-        return;
-    }
-
-    if (type != kEnvelopeTypeCmd) {
-        sendProtocolError(client, cid, kErrorCodeInvalidType, kMessageInvalidType);
-        return;
-    }
-
-    while (!topic.empty() && (topic.back() == ' ' || topic.back() == '\t'))
-        topic.pop_back();
-    if (topic.empty()) {
-        sendProtocolError(client, cid, kErrorCodeMissingTopic, kMessageMissingTopic);
-        return;
-    }
+    const CommandFrame &frame = std::get<CommandFrame>(parsed);
 
     // The API takes the payload as text; the frame was parsed to read the envelope, so
     // the sub-object is serialized once here. That is the cost side of the text
     // boundary, and it sits on the command path rather than the event path.
-    handleCommand(client, *cid, topic, payload.dump());
+    handleCommand(client, frame.cid, frame.topic, frame.payload.dump());
 }
 
 } // namespace phicore::transport::cli
