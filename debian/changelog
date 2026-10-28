@@ -1,3 +1,10 @@
+phi-transport-cli (0.0~git202610280928.11c64ac-1) trixie; urgency=medium
+
+  * Bound the CLI socket's clients; keep answers for clients that hung
+    up.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Wed, 28 Oct 2026 09:28:42 +0100
+
 phi-transport-cli (0.0~git202610271410.8bc0c73-1) trixie; urgency=medium
 
   *   * Command frames through commandframe.h (a mistyped member no
