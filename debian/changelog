@@ -1,3 +1,10 @@
+phi-transport-cli (0.0~git202610281126.086b9b2-1) trixie; urgency=medium
+
+  * phi-cli channel remove <channelId>: removes a channel its device no
+    longer supports.
+
+ -- Marius Schumacher <marius.schumacher@phisys.com>  Wed, 28 Oct 2026 11:26:50 +0100
+
 phi-transport-cli (0.0~git202610280928.11c64ac-1) trixie; urgency=medium
 
   * Bound the CLI socket's clients; keep answers for clients that hung
