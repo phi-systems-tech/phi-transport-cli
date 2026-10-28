@@ -417,10 +417,15 @@ bool sendCommand(const std::string &socketPath,
                          kWriteTimeoutMs, errorOut))
         return false;
 
+    // One deadline for the whole answer. Every client gets every event, so
+    // timing each read on its own let a busy house keep a command waiting
+    // forever for an answer that was never coming.
+    const std::int64_t deadlineMs = nowMs() + kResponseTimeoutMs;
     bool ackSeen = false;
     while (true) {
         std::string line;
-        const auto read = socket.readLine(kResponseTimeoutMs, &line, errorOut);
+        const auto remainingMs = static_cast<int>(std::max<std::int64_t>(0, deadlineMs - nowMs()));
+        const auto read = socket.readLine(remainingMs, &line, errorOut);
         if (read == phicore::cli::LineSocket::Read::Timeout) {
             if (errorOut)
                 *errorOut = "Timeout waiting for response";

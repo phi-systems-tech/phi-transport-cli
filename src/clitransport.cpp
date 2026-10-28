@@ -10,7 +10,9 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <variant>
@@ -28,6 +30,17 @@ constexpr const char kDefaultSocketPath[] = "/var/lib/phi/@1/cli.sock";
 
 /// A line a client may grow before it is a protocol violation, not a command.
 constexpr std::size_t kMaxLineBytes = 4 * 1024 * 1024;
+
+/// Bytes queued for a client that does not read - every event goes to every
+/// client, so a stalled one grows this on its own. Past it the client is gone.
+constexpr std::size_t kMaxPendingOutBytes = 32 * 1024 * 1024;
+
+/// Clients at once. The socket is the household's tools, not a public door;
+/// this only keeps a runaway script from taking the process's descriptors.
+constexpr std::size_t kMaxClients = 64;
+
+/// How long a client that already hung up may still wait for its answers.
+constexpr std::chrono::milliseconds kLingerTimeout{60000};
 
 std::string socketPathFromConfig(const Json &config)
 {
@@ -91,7 +104,15 @@ bool CliTransport::start(std::string_view configJson, std::string *errorString)
         if (ec)
             return fail("Failed to create socket directory: " + dir.string());
     }
-    ::unlink(socketPath.c_str());
+    // The socket file's permissions are the credential: owner and group only.
+    // bind() creates the file with whatever the process umask leaves, and the
+    // umask is process-wide (this runs inside core, among other threads), so
+    // the socket is bound under a name nobody connects to, narrowed, and only
+    // then moved to the name clients use.
+    const std::string stagingPath = socketPath + ".new";
+    if (stagingPath.size() >= sizeof(sockaddr_un{}.sun_path))
+        return fail("socketPath is longer than a unix socket path may be");
+    ::unlink(stagingPath.c_str());
 
     const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0)
@@ -99,14 +120,18 @@ bool CliTransport::start(std::string_view configJson, std::string *errorString)
 
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    std::memcpy(addr.sun_path, socketPath.c_str(), socketPath.size() + 1);
+    std::memcpy(addr.sun_path, stagingPath.c_str(), stagingPath.size() + 1);
     if (::bind(fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) < 0) {
         const int err = errno;
         ::close(fd);
         return fail(std::string("bind() failed: ") + std::strerror(err));
     }
-    // The socket file's permissions are the credential: owner and group only.
-    ::chmod(socketPath.c_str(), 0660);
+    if (::chmod(stagingPath.c_str(), 0660) < 0 || ::rename(stagingPath.c_str(), socketPath.c_str()) < 0) {
+        const int err = errno;
+        ::close(fd);
+        ::unlink(stagingPath.c_str());
+        return fail(std::string("Failed to publish the socket: ") + std::strerror(err));
+    }
     if (::listen(fd, 16) < 0) {
         const int err = errno;
         ::close(fd);
@@ -140,6 +165,7 @@ void CliTransport::stop()
         client->closed = true;
         client->readWatch.reset();
         client->writeWatch.reset();
+        client->lingerDeadline.reset();
         ::close(client->fd);
     }
     m_clients.clear();
@@ -169,6 +195,16 @@ void CliTransport::acceptClients()
                 return;
             return; // transient accept errors: the watch will fire again
         }
+        if (m_clients.size() >= kMaxClients) {
+            ::close(fd);
+            writeLog(LogLevel::Warn,
+                     makeCategory(LogCategory::Transport),
+                     "Refused a CLI client: %1 are connected already",
+                     {Scalar{static_cast<std::int64_t>(m_clients.size())}},
+                     "cli.tooManyClients",
+                     jsonObject({{"clients", std::to_string(m_clients.size())}}));
+            continue;
+        }
 
         auto client = std::make_shared<Client>();
         client->fd = fd;
@@ -187,6 +223,9 @@ void CliTransport::onClientReadable(Client *client)
     if (client->closed)
         return;
 
+    // `printf '...\n' | socat - UNIX:...` sends its line and its FIN in one go.
+    // The line is still a command and its answer still the client's, so the
+    // FIN is noted, not acted on, until both are through.
     char chunk[16 * 1024];
     while (true) {
         const ssize_t got = ::read(client->fd, chunk, sizeof(chunk));
@@ -194,11 +233,15 @@ void CliTransport::onClientReadable(Client *client)
             client->inBuffer.append(chunk, static_cast<std::size_t>(got));
             continue;
         }
-        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        if (got == 0) {
+            client->peerClosed = true;
             break;
-        if (got < 0 && errno == EINTR)
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            break;
+        if (errno == EINTR)
             continue;
-        dropClient(client->fd); // closed by the peer, or a read error
+        dropClient(client->fd); // a read error
         return;
     }
 
@@ -216,8 +259,32 @@ void CliTransport::onClientReadable(Client *client)
             processLine(client, line);
         start = newline + 1;
     }
+    if (client->closed)
+        return;
     client->inBuffer.erase(0, start);
-    if (client->inBuffer.size() > kMaxLineBytes)
+    if (client->inBuffer.size() > kMaxLineBytes) {
+        dropClient(client->fd);
+        return;
+    }
+    if (client->peerClosed) {
+        client->readWatch.setEnabled(false);
+        const int fd = client->fd;
+        client->lingerDeadline = runtimeLoop()->timerAfter(kLingerTimeout, [this, fd]() { dropClient(fd); });
+        closeIfDone(client);
+    }
+}
+
+bool CliTransport::hasPendingCommands(int fd) const
+{
+    return std::any_of(m_pendingCommands.begin(), m_pendingCommands.end(),
+                       [fd](const auto &entry) { return entry.second.clientFd == fd; });
+}
+
+void CliTransport::closeIfDone(Client *client)
+{
+    if (client->closed || !client->peerClosed)
+        return;
+    if (client->outBuffer.empty() && !hasPendingCommands(client->fd))
         dropClient(client->fd);
 }
 
@@ -226,12 +293,13 @@ void CliTransport::onClientWritable(Client *client)
     if (client->closed)
         return;
     flushClient(client);
+    closeIfDone(client);
 }
 
 void CliTransport::flushClient(Client *client)
 {
     while (!client->outBuffer.empty()) {
-        const ssize_t sent = ::write(client->fd, client->outBuffer.data(), client->outBuffer.size());
+        const ssize_t sent = ::send(client->fd, client->outBuffer.data(), client->outBuffer.size(), MSG_NOSIGNAL);
         if (sent > 0) {
             client->outBuffer.erase(0, static_cast<std::size_t>(sent));
             continue;
@@ -269,6 +337,7 @@ void CliTransport::dropClient(int fd)
     runtimeLoop()->post([victim]() {
         victim->readWatch.reset();
         victim->writeWatch.reset();
+        victim->lingerDeadline.reset();
         ::close(victim->fd);
     });
 }
@@ -292,7 +361,9 @@ void CliTransport::onCoreAsyncResult(CmdId cmdId, std::string_view payloadJson)
     auto clientIt = m_clients.find(pending.clientFd);
     if (clientIt == m_clients.end())
         return;
-    sendCmdResponse(clientIt->second.get(), pending.cid, pending.cmdTopic, payloadJson);
+    Client *client = clientIt->second.get();
+    sendCmdResponse(client, pending.cid, pending.cmdTopic, payloadJson);
+    closeIfDone(client);
 }
 
 void CliTransport::onCoreEvent(std::string_view topic, std::string_view payloadJson)
@@ -315,6 +386,16 @@ void CliTransport::send(Client *client,
     // this wire's framing and the only part that differs from the WS transport.
     JsonText out = makeEnvelope(type, topic, cid, payloadJson);
     out += '\n';
+    if (!client->outBuffer.empty() && client->outBuffer.size() + out.size() > kMaxPendingOutBytes) {
+        writeLog(LogLevel::Warn,
+                 makeCategory(LogCategory::Transport),
+                 "Dropped a CLI client that stopped reading (%1 bytes queued)",
+                 {Scalar{static_cast<std::int64_t>(client->outBuffer.size())}},
+                 "cli.sendQueueFull",
+                 jsonObject({{"queued", std::to_string(client->outBuffer.size())}}));
+        dropClient(client->fd);
+        return;
+    }
     client->outBuffer += out;
     flushClient(client);
 }

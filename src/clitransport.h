@@ -41,6 +41,10 @@ private:
     struct Client {
         int fd = -1;
         bool closed = false;
+        /// The client sent its FIN: nothing more comes in, but what it asked
+        /// for still goes out before the socket is closed.
+        bool peerClosed = false;
+        phi::runtime::Timer lingerDeadline;
         phi::runtime::FdWatch readWatch;
         phi::runtime::FdWatch writeWatch; // enabled only while outBuffer holds bytes
         std::string inBuffer;
@@ -72,6 +76,9 @@ private:
 
     void flushClient(Client *client);
     void dropClient(int fd);
+    /// Closes a client whose peer is gone once nothing it asked for is left.
+    void closeIfDone(Client *client);
+    bool hasPendingCommands(int fd) const;
     void closeListener();
 
     int m_listenFd = -1;
