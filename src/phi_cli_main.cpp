@@ -198,6 +198,7 @@ void printUsage()
         << "  phi-cli backend create --kind <kind> --id <name> [--resource <resource>] [--json] [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backend remove <backend> [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backend start|stop|restart <backend> [--tenant <tenant>] [--socket <path>]\n"
+        << "  phi-cli channel remove <channelId> [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli user list [--tenant <tenant>] [--socket <path>] [--json]\n"
         << "  phi-cli user passwd <username> [--password-stdin] [--tenant <tenant>] [--socket <path>]\n"
         << "  phi-cli backup list [--json] [--tenant <tenant>] [--socket <path>]\n"
@@ -684,6 +685,9 @@ struct CliOptions {
     // would both keep.
     std::string username;
     bool passwordStdin = false;
+    // `channel remove`: a channel its device no longer has. Core refuses one
+    // still reported; a stale one (gone for now) stays greyed until removed.
+    int channelId = 0;
     // `backup ...`: the backup or file named, where an export goes, and the
     // switches. The passphrase never comes as an argument either.
     std::string backupTarget;
@@ -900,6 +904,43 @@ bool parseUserScope(const std::vector<std::string> &positionalArgs, CliOptions *
     return true;
 }
 
+/// `channel remove <channelId>`: core's cmd.channel.remove, for a channel the
+/// device no longer supports - the UI does not offer it, because an
+/// automation that uses the channel breaks (core disables it and says so).
+bool parseChannelScope(const std::vector<std::string> &positionalArgs, CliOptions *opts, std::string *errorOut)
+{
+    const auto refuse = [errorOut](const std::string &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+    if (opts->action != "remove")
+        return refuse("Unknown action: " + opts->action);
+
+    for (std::size_t i = 3; i < positionalArgs.size(); ++i) {
+        const std::string &arg = positionalArgs.at(i);
+        if (arg == "--socket") {
+            if (i + 1 >= positionalArgs.size())
+                return refuse("Missing value for --socket");
+            opts->socketPath = positionalArgs.at(++i);
+            opts->socketPathExplicit = true;
+            continue;
+        }
+        if (!arg.starts_with("-") && opts->channelId == 0) {
+            bool ok = false;
+            const int id = str::toInt(arg, &ok);
+            if (!ok || id <= 0)
+                return refuse("Invalid channel id: " + arg);
+            opts->channelId = id;
+            continue;
+        }
+        return refuse("Unknown argument: " + arg);
+    }
+    if (opts->channelId == 0)
+        return refuse("channel remove requires <channelId>");
+    return true;
+}
+
 /// `backup <action> ...` (docs/backup-concept.md in phi-core).
 bool parseBackupScope(const std::vector<std::string> &positionalArgs, CliOptions *opts, std::string *errorOut)
 {
@@ -1033,10 +1074,12 @@ bool parseCliOptions(const std::vector<std::string> &args, CliOptions *optsOut, 
         return true;
     }
 
-    if (opts.scope == "radio" || opts.scope == "backend" || opts.scope == "user" || opts.scope == "backup") {
-        const bool parsed = opts.scope == "user"   ? parseUserScope(positionalArgs, &opts, errorOut)
-                            : opts.scope == "backup" ? parseBackupScope(positionalArgs, &opts, errorOut)
-                                                     : parseHostScope(positionalArgs, &opts, errorOut);
+    if (opts.scope == "radio" || opts.scope == "backend" || opts.scope == "user" || opts.scope == "backup"
+        || opts.scope == "channel") {
+        const bool parsed = opts.scope == "user"      ? parseUserScope(positionalArgs, &opts, errorOut)
+                            : opts.scope == "backup"  ? parseBackupScope(positionalArgs, &opts, errorOut)
+                            : opts.scope == "channel" ? parseChannelScope(positionalArgs, &opts, errorOut)
+                                                      : parseHostScope(positionalArgs, &opts, errorOut);
         if (!parsed)
             return false;
 
@@ -1921,6 +1964,19 @@ int main(int argc, char **argv)
 
     if (opts.scope == "backup")
         return runBackupCommand(opts, backupFiles);
+
+    if (opts.scope == "channel") {
+        Json payload = Json::object();
+        payload["channelId"] = opts.channelId;
+        Json response;
+        std::string error;
+        if (!sendCommand(opts.socketPath, "cmd.channel.remove", payload, &response, &error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+        std::cout << "Channel " << opts.channelId << " removed\n";
+        return 0;
+    }
 
     if (opts.scope == "user") {
         if (opts.action == "list") {
