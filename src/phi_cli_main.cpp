@@ -377,6 +377,30 @@ void printUserTable(const Json &users)
     }
 }
 
+// Core's error message is a translation key with %1..%9 placeholders and the
+// values under "params"; a terminal shows it in English, filled in.
+std::string errorText(const Json &errorValue)
+{
+    const std::string message = jsonString(errorValue, "message");
+    const Json params = jsonValue(errorValue, "params");
+    if (!params.is_array() || params.empty())
+        return message;
+    std::string out;
+    out.reserve(message.size() + 16);
+    for (std::size_t i = 0; i < message.size(); ++i) {
+        if (message[i] == '%' && i + 1 < message.size() && message[i + 1] >= '1' && message[i + 1] <= '9') {
+            const std::size_t n = static_cast<std::size_t>(message[i + 1] - '1');
+            if (n < params.size()) {
+                out += params[n].is_string() ? params[n].get<std::string>() : dumpCompact(params[n]);
+                ++i;
+                continue;
+            }
+        }
+        out += message[i];
+    }
+    return out;
+}
+
 std::string responseErrorMessage(const Json &payload)
 {
     const Json errorValue = jsonValue(payload, "error");
@@ -384,7 +408,7 @@ std::string responseErrorMessage(const Json &payload)
         const std::string msg = jsonString(errorValue, "msg");
         if (!msg.empty())
             return msg;
-        return jsonString(errorValue, "message");
+        return errorText(errorValue);
     }
     if (errorValue.is_string())
         return errorValue.get<std::string>();
@@ -2337,7 +2361,7 @@ int main(int argc, char **argv)
             }
             const Json errorValue = jsonValue(response, "error");
             if (errorValue.is_object())
-                std::cout << "error: " << jsonString(errorValue, "message") << "\n";
+                std::cout << "error: " << errorText(errorValue) << "\n";
         }
         return status == 0 ? 0 : 1;
     }
